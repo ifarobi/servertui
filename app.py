@@ -1,0 +1,773 @@
+"""
+ServerTUI — Local server dashboard for managing Cloudflare tunnels,
+Docker containers, and monitoring system resources.
+"""
+
+import subprocess
+import shlex
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime
+from threading import Thread, Lock
+
+import docker
+import psutil
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    RichLog,
+    Static,
+)
+
+# ─── Config ──────────────────────────────────────────────────────────
+
+TUNNELS = [
+    {
+        "name": "coloring",
+        "service": "cloudflared-coloring",
+        "domain": "coloring.cafe",
+        "description": "Coloring Cafe",
+    },
+    {
+        "name": "noko",
+        "service": "cloudflared-noko",
+        "domain": "noko.ifarobi.com",
+        "description": "Noko POS",
+    },
+    {
+        "name": "ollage",
+        "service": "cloudflared-ollage",
+        "domain": "ollage.ifarobi.com",
+        "description": "Ollage Photo Collage",
+    },
+]
+
+OLLAMA_BASE = "http://localhost:11434"
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def run_cmd(cmd: str, timeout: int = 5) -> str:
+    try:
+        result = subprocess.run(
+            shlex.split(cmd), capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"error: {e}"
+
+
+def systemctl_user(action: str, service: str) -> str:
+    return run_cmd(f"systemctl --user {action} {service}")
+
+
+def fmt_bytes(n: int | float) -> str:
+    if n < 0:
+        return "N/A"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def bar(percent: float, width: int = 20) -> str:
+    filled = int(width * percent / 100)
+    empty = width - filled
+    if percent > 90:
+        color = "red"
+    elif percent > 70:
+        color = "yellow"
+    else:
+        color = "green"
+    return f"[{color}]{'█' * filled}{'░' * empty}[/]"
+
+
+def get_uptime() -> str:
+    boot = datetime.fromtimestamp(psutil.boot_time())
+    delta = datetime.now() - boot
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    mins, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m")
+    return " ".join(parts)
+
+
+def ollama_api(endpoint: str) -> dict | None:
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE}{endpoint}")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+# ─── Background data store ───────────────────────────────────────────
+# All expensive I/O runs in a thread. The UI only reads from this cache.
+
+class DataStore:
+    """Thread-safe cache for all dashboard data."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._data = {
+            "system": {},
+            "tunnels": [],
+            "docker": [],
+            "ollama": {},
+        }
+
+    def get(self, key: str):
+        with self._lock:
+            return self._data.get(key)
+
+    def set(self, key: str, value):
+        with self._lock:
+            self._data[key] = value
+
+    def fetch_system(self):
+        """Fetch system stats (cheap, ~instant)."""
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_count = psutil.cpu_count()
+        cpu_freq = psutil.cpu_freq()
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        disk = psutil.disk_usage("/")
+        net = psutil.net_io_counters()
+        load1, load5, load15 = psutil.getloadavg()
+
+        self.set("system", {
+            "cpu_percent": cpu_percent,
+            "cpu_count": cpu_count,
+            "cpu_freq": f"{cpu_freq.current:.0f} MHz" if cpu_freq else "N/A",
+            "mem": mem,
+            "swap": swap,
+            "disk": disk,
+            "net_sent": net.bytes_sent,
+            "net_recv": net.bytes_recv,
+            "load": (load1, load5, load15),
+            "uptime": get_uptime(),
+        })
+
+    def fetch_tunnels(self):
+        """Fetch tunnel statuses (cheap, ~instant)."""
+        tunnels = []
+        for t in TUNNELS:
+            raw = run_cmd(
+                f"systemctl --user show {t['service']} "
+                "--property=ActiveState,SubState,MainPID,MemoryCurrent "
+                "--no-pager"
+            )
+            info = {}
+            for line in raw.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k] = v
+            tunnels.append({**t, **info})
+        self.set("tunnels", tunnels)
+
+    def fetch_docker(self):
+        """Fetch docker container list + stats (EXPENSIVE — runs in bg)."""
+        try:
+            client = docker.from_env()
+            client.ping()
+        except Exception:
+            self.set("docker", None)
+            return
+
+        containers = []
+        for c in client.containers.list(all=True):
+            entry = {
+                "name": c.name,
+                "status": c.status,
+                "image": c.image.tags[0] if c.image.tags else c.short_id,
+                "cpu_pct": 0.0,
+                "mem_usage": 0,
+                "mem_limit": 0,
+            }
+            if c.status == "running":
+                try:
+                    stats = c.stats(stream=False)
+                    cpu_delta = (
+                        stats["cpu_stats"]["cpu_usage"]["total_usage"]
+                        - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+                    )
+                    sys_delta = (
+                        stats["cpu_stats"]["system_cpu_usage"]
+                        - stats["precpu_stats"]["system_cpu_usage"]
+                    )
+                    n_cpus = stats["cpu_stats"].get("online_cpus", 1)
+                    entry["cpu_pct"] = (
+                        (cpu_delta / sys_delta) * n_cpus * 100
+                        if sys_delta > 0 else 0
+                    )
+                    entry["mem_usage"] = stats["memory_stats"].get("usage", 0)
+                    entry["mem_limit"] = stats["memory_stats"].get("limit", 0)
+                except Exception:
+                    pass
+            containers.append(entry)
+
+        containers.sort(key=lambda c: (c["status"] != "running", c["name"]))
+        self.set("docker", containers)
+
+    def fetch_ollama(self):
+        """Fetch ollama status (cheap, HTTP calls)."""
+        version = ollama_api("/api/version")
+        tags = ollama_api("/api/tags")
+        ps = ollama_api("/api/ps")
+        self.set("ollama", {
+            "online": version is not None,
+            "version": version.get("version", "?") if version else "?",
+            "models": tags.get("models", []) if tags else [],
+            "running": ps.get("models", []) if ps else [],
+        })
+
+
+STORE = DataStore()
+
+
+def bg_fetch_expensive():
+    """Background thread: fetch Docker stats (slow) + ollama."""
+    STORE.fetch_docker()
+    STORE.fetch_ollama()
+
+
+def bg_fetch_cheap():
+    """Fetch quick data (system + tunnels) — can run on main timer."""
+    STORE.fetch_system()
+    STORE.fetch_tunnels()
+
+
+# ─── Widgets ─────────────────────────────────────────────────────────
+
+class SystemPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="sys-content")
+
+    def refresh_data(self) -> None:
+        s = STORE.get("system")
+        if not s:
+            self.query_one("#sys-content", Static).update("[dim]Loading...[/]")
+            return
+
+        mem = s["mem"]
+        swap = s["swap"]
+        disk = s["disk"]
+
+        self.query_one("#sys-content", Static).update(
+            f"[bold cyan]═══ System Resources ═══[/]\n\n"
+            f"  [bold]Uptime:[/]     {s['uptime']}\n"
+            f"  [bold]Load:[/]       {s['load'][0]:.2f}  {s['load'][1]:.2f}  {s['load'][2]:.2f}\n\n"
+            f"  [bold cyan]CPU[/]        {bar(s['cpu_percent'])}  {s['cpu_percent']:5.1f}%\n"
+            f"               {s['cpu_count']} cores @ {s['cpu_freq']}\n\n"
+            f"  [bold green]RAM[/]        {bar(mem.percent)}  {mem.percent:5.1f}%\n"
+            f"               {fmt_bytes(mem.used)} / {fmt_bytes(mem.total)}\n\n"
+            f"  [bold yellow]Swap[/]       {bar(swap.percent)}  {swap.percent:5.1f}%\n"
+            f"               {fmt_bytes(swap.used)} / {fmt_bytes(swap.total)}\n\n"
+            f"  [bold magenta]Disk /[/]     {bar(disk.percent)}  {disk.percent:5.1f}%\n"
+            f"               {fmt_bytes(disk.used)} / {fmt_bytes(disk.total)}\n\n"
+            f"  [bold blue]Net ↑[/]      {fmt_bytes(s['net_sent'])}\n"
+            f"  [bold blue]Net ↓[/]      {fmt_bytes(s['net_recv'])}\n"
+        )
+
+
+class TunnelPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="tunnel-content")
+
+    def refresh_data(self) -> None:
+        tunnels = STORE.get("tunnels")
+        if not tunnels:
+            self.query_one("#tunnel-content", Static).update("[dim]Loading...[/]")
+            return
+
+        lines = ["[bold cyan]═══ Cloudflare Tunnels ═══[/]\n"]
+        for t in tunnels:
+            state = t.get("ActiveState", "unknown")
+            sub = t.get("SubState", "unknown")
+            pid = t.get("MainPID", "0")
+            mem_raw = t.get("MemoryCurrent", "[not set]")
+
+            if state == "active" and sub == "running":
+                icon = "[bold green]●[/]"
+                status_str = "[green]running[/]"
+            elif state == "active":
+                icon = "[bold yellow]●[/]"
+                status_str = f"[yellow]{sub}[/]"
+            else:
+                icon = "[bold red]●[/]"
+                status_str = f"[red]{state}[/]"
+
+            try:
+                mem_str = fmt_bytes(int(mem_raw))
+            except (ValueError, TypeError):
+                mem_str = "N/A"
+
+            lines.append(
+                f"  {icon}  [bold]{t['description']:<24}[/] {status_str}\n"
+                f"       {t['domain']:<28} PID {pid:<8} RAM {mem_str}\n"
+            )
+
+        lines.append("[dim]  Keys: [bold]s[/]=start  [bold]t[/]=stop  [bold]r[/]=restart  [bold]l[/]=logs[/]")
+        self.query_one("#tunnel-content", Static).update("\n".join(lines))
+
+
+class DockerPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="docker-content")
+
+    def refresh_data(self) -> None:
+        containers = STORE.get("docker")
+        lines = ["[bold cyan]═══ Docker Containers ═══[/]\n"]
+
+        if containers is None:
+            lines.append("  [red]Docker daemon not reachable[/]")
+        elif not containers:
+            lines.append("  [dim]No containers found[/]")
+        else:
+            for c in containers:
+                name = c["name"]
+                status = c["status"]
+                image = c["image"]
+
+                if status == "running":
+                    icon = "[bold green]●[/]"
+                    status_str = f"[green]{status}[/]"
+                    mem_str = (
+                        f"{fmt_bytes(c['mem_usage'])} / {fmt_bytes(c['mem_limit'])}"
+                        if c["mem_usage"] else "N/A"
+                    )
+                    lines.append(
+                        f"  {icon}  [bold]{name:<28}[/] {status_str}\n"
+                        f"       {image}\n"
+                        f"       CPU: {c['cpu_pct']:.1f}%   RAM: {mem_str}\n"
+                    )
+                else:
+                    icon = "[bold red]●[/]"
+                    lines.append(
+                        f"  {icon}  [bold]{name:<28}[/] [red]{status}[/]\n"
+                        f"       {image}\n"
+                    )
+
+        lines.append("[dim]  Keys: [bold]u[/]=start  [bold]d[/]=stop  [bold]x[/]=restart[/]")
+        self.query_one("#docker-content", Static).update("\n".join(lines))
+
+
+class OllamaPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="ollama-content")
+
+    def refresh_data(self) -> None:
+        status = STORE.get("ollama") or {}
+        lines = ["[bold cyan]═══ Ollama LLM ═══[/]\n"]
+
+        if not status.get("online"):
+            lines.append("  [red]● Offline[/]  [dim]Ollama not running[/]\n")
+            self.query_one("#ollama-content", Static).update("\n".join(lines))
+            return
+
+        lines.append(f"  [green]● Online[/]  v{status['version']}\n")
+
+        running = status.get("running", [])
+        if running:
+            lines.append("  [bold green]Loaded in memory:[/]")
+            for m in running:
+                name = m.get("name", "?")
+                size = m.get("size", 0)
+                vram = m.get("size_vram", 0)
+                ram = size - vram
+                details = m.get("details", {})
+                params = details.get("parameter_size", "")
+                quant = details.get("quantization_level", "")
+
+                expires = m.get("expires_at", "")
+                exp_str = ""
+                if expires:
+                    try:
+                        exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                        now = datetime.now(exp_dt.tzinfo)
+                        remaining = exp_dt - now
+                        if remaining.total_seconds() > 0:
+                            exp_str = f"expires in {int(remaining.total_seconds() / 60)}m"
+                        else:
+                            exp_str = "expiring"
+                    except Exception:
+                        pass
+
+                lines.append(f"    [bold]{name}[/]")
+                parts = []
+                if params:
+                    parts.append(params)
+                if quant:
+                    parts.append(quant)
+                if vram > 0:
+                    parts.append(f"VRAM {fmt_bytes(vram)}")
+                if ram > 0:
+                    parts.append(f"RAM {fmt_bytes(ram)}")
+                if exp_str:
+                    parts.append(f"[dim]{exp_str}[/]")
+                if parts:
+                    lines.append(f"    {' · '.join(parts)}")
+                lines.append("")
+        else:
+            lines.append("  [dim]No models loaded in memory[/]\n")
+
+        models = status.get("models", [])
+        running_names = {m.get("name") for m in running}
+        installed = [m for m in models if m.get("name") not in running_names]
+
+        if installed:
+            lines.append(f"  [bold]Installed ({len(models)} total):[/]")
+            for m in installed:
+                name = m.get("name", "?")
+                size = m.get("size", 0)
+                details = m.get("details", {})
+                params = details.get("parameter_size", "")
+                quant = details.get("quantization_level", "")
+                is_cloud = bool(m.get("remote_model"))
+
+                loc = "☁️" if is_cloud else "💾"
+                parts = [loc]
+                if params:
+                    parts.append(params)
+                if quant:
+                    parts.append(quant)
+                if not is_cloud:
+                    parts.append(fmt_bytes(size))
+                lines.append(f"    [dim]{name:<30}[/] {' · '.join(parts)}")
+            lines.append("")
+
+        self.query_one("#ollama-content", Static).update("\n".join(lines))
+
+
+# ─── Modal screens ───────────────────────────────────────────────────
+
+class SelectorScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, items: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.title_text = title
+        self.items = items
+
+    def compose(self) -> ComposeResult:
+        with Container(id="selector-box"):
+            yield Static(f"[bold]{self.title_text}[/]\n", id="selector-title")
+            table = DataTable(id="selector-table")
+            table.cursor_type = "row"
+            table.add_columns("#", "Name")
+            for i, (key, label) in enumerate(self.items, 1):
+                table.add_row(str(i), label, key=key)
+            yield table
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(str(event.row_key.value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LogScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close")]
+
+    def __init__(self, title: str, log_cmd: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.log_cmd = log_cmd
+
+    def compose(self) -> ComposeResult:
+        with Container(id="log-box"):
+            yield Static(
+                f"[bold]{self.title_text}[/]  [dim]Press ESC or q to close[/]\n",
+                id="log-title",
+            )
+            yield RichLog(id="log-view", wrap=True, highlight=True, markup=True)
+
+    def on_mount(self) -> None:
+        log_view = self.query_one("#log-view", RichLog)
+        output = run_cmd(self.log_cmd, timeout=10)
+        for line in output.splitlines():
+            log_view.write(line)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+# ─── Main App ────────────────────────────────────────────────────────
+
+class ServerTUI(App):
+    TITLE = "ServerTUI"
+    SUB_TITLE = "ifr-ser5"
+
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #main-container {
+        height: 1fr;
+    }
+
+    #left-col {
+        width: 1fr;
+        max-width: 46;
+        min-width: 36;
+        border-right: solid $primary-background;
+        padding: 1 2;
+    }
+
+    #right-col {
+        width: 2fr;
+        padding: 1 2;
+    }
+
+    #tunnel-section { height: auto; padding-bottom: 1; }
+    #docker-section { height: auto; }
+    #ollama-section { height: auto; padding-top: 1; }
+
+    /* Narrow layout (<90 cols): stack vertically */
+
+    .narrow #main-container {
+        layout: vertical;
+        overflow-y: auto;
+    }
+
+    .narrow #left-col {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        border-right: none;
+        border-bottom: solid $primary-background;
+        padding: 1 2;
+    }
+
+    .narrow #right-col {
+        width: 100%;
+        height: auto;
+        padding: 1 2;
+    }
+
+    /* Modals */
+
+    #selector-box {
+        width: 60;
+        max-width: 95%;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+        margin: 2 4;
+    }
+
+    #selector-table { height: auto; max-height: 20; }
+
+    #log-box {
+        width: 90%;
+        height: 85%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+        margin: 1 2;
+    }
+
+    #log-view { height: 1fr; }
+
+    SelectorScreen, LogScreen { align: center middle; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("s", "tunnel_start", "Start tunnel"),
+        Binding("t", "tunnel_stop", "Stop tunnel"),
+        Binding("r", "tunnel_restart", "Restart tunnel"),
+        Binding("l", "tunnel_logs", "Tunnel logs"),
+        Binding("u", "docker_start", "Start container"),
+        Binding("d", "docker_stop", "Stop container"),
+        Binding("x", "docker_restart", "Restart container"),
+        Binding("f", "refresh", "Refresh"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="main-container"):
+            with Vertical(id="left-col"):
+                yield SystemPanel(id="sys-panel")
+            with VerticalScroll(id="right-col"):
+                with Container(id="tunnel-section"):
+                    yield TunnelPanel(id="tunnel-panel")
+                with Container(id="docker-section"):
+                    yield DockerPanel(id="docker-panel")
+                with Container(id="ollama-section"):
+                    yield OllamaPanel(id="ollama-panel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        # Prime CPU counter
+        psutil.cpu_percent(interval=None)
+        # Initial cheap fetch (instant)
+        bg_fetch_cheap()
+        self._render_ui()
+        self._check_layout()
+        # Kick off first expensive fetch in background
+        self._start_bg_fetch()
+        # Fast timer: refresh cheap data + re-render every 2s
+        self.set_interval(2, self._tick_fast)
+        # Slow timer: refresh expensive data (docker stats) every 15s
+        self.set_interval(15, self._start_bg_fetch)
+
+    def _tick_fast(self) -> None:
+        """Quick refresh: system + tunnels only, then re-render all."""
+        bg_fetch_cheap()
+        self._render_ui()
+
+    def _start_bg_fetch(self) -> None:
+        """Kick off expensive fetches in a daemon thread."""
+        thread = Thread(target=self._bg_worker, daemon=True)
+        thread.start()
+
+    def _bg_worker(self) -> None:
+        """Runs in background thread — fetches Docker stats + Ollama."""
+        bg_fetch_expensive()
+        # Schedule a UI re-render on the main thread
+        self.call_from_thread(self._render_ui)
+
+    def _render_ui(self) -> None:
+        """Re-render all panels from cached data. Always instant."""
+        self.query_one("#sys-panel", SystemPanel).refresh_data()
+        self.query_one("#tunnel-panel", TunnelPanel).refresh_data()
+        self.query_one("#docker-panel", DockerPanel).refresh_data()
+        self.query_one("#ollama-panel", OllamaPanel).refresh_data()
+
+    def on_resize(self) -> None:
+        self._check_layout()
+
+    def _check_layout(self) -> None:
+        if self.size.width < 90:
+            self.add_class("narrow")
+        else:
+            self.remove_class("narrow")
+
+    # ── Tunnel actions ──
+
+    def _tunnel_items(self) -> list[tuple[str, str]]:
+        items = []
+        tunnels = STORE.get("tunnels") or []
+        for t in tunnels:
+            state = t.get("ActiveState", "unknown")
+            sub = t.get("SubState", "unknown")
+            icon = "🟢" if (state == "active" and sub == "running") else "🔴"
+            items.append((t["service"], f"{icon} {t['description']} ({t['domain']})"))
+        return items
+
+    def _on_tunnel_selected(self, action: str, service: str | None) -> None:
+        if service is None:
+            return
+        systemctl_user(action, service)
+        self.notify(f"{action.capitalize()}ed {service}")
+        bg_fetch_cheap()
+        self._render_ui()
+
+    def action_tunnel_start(self) -> None:
+        self.push_screen(
+            SelectorScreen("Start Tunnel", self._tunnel_items()),
+            lambda s: self._on_tunnel_selected("start", s),
+        )
+
+    def action_tunnel_stop(self) -> None:
+        self.push_screen(
+            SelectorScreen("Stop Tunnel", self._tunnel_items()),
+            lambda s: self._on_tunnel_selected("stop", s),
+        )
+
+    def action_tunnel_restart(self) -> None:
+        self.push_screen(
+            SelectorScreen("Restart Tunnel", self._tunnel_items()),
+            lambda s: self._on_tunnel_selected("restart", s),
+        )
+
+    def action_tunnel_logs(self) -> None:
+        def callback(service: str | None) -> None:
+            if service is None:
+                return
+            self.push_screen(LogScreen(
+                f"Logs: {service}",
+                f"journalctl --user -u {service} --no-pager -n 100",
+            ))
+        self.push_screen(SelectorScreen("View Tunnel Logs", self._tunnel_items()), callback)
+
+    # ── Docker actions ──
+
+    def _docker_items(self, status_filter: str | None = None) -> list[tuple[str, str]]:
+        containers = STORE.get("docker") or []
+        items = []
+        for c in containers:
+            if status_filter and c["status"] != status_filter:
+                continue
+            icon = "🟢" if c["status"] == "running" else "🔴"
+            items.append((c["name"], f"{icon} {c['name']} ({c['status']})"))
+        return items
+
+    def _docker_action(self, action: str, name: str | None) -> None:
+        if name is None:
+            return
+        try:
+            client = docker.from_env()
+            container = client.containers.get(name)
+            getattr(container, action)()
+            self.notify(f"{action.capitalize()}ed {name}")
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+        self._start_bg_fetch()
+
+    def action_docker_start(self) -> None:
+        items = self._docker_items(status_filter="exited")
+        if not items:
+            self.notify("No stopped containers", severity="warning")
+            return
+        self.push_screen(
+            SelectorScreen("Start Container", items),
+            lambda n: self._docker_action("start", n),
+        )
+
+    def action_docker_stop(self) -> None:
+        items = self._docker_items(status_filter="running")
+        if not items:
+            self.notify("No running containers", severity="warning")
+            return
+        self.push_screen(
+            SelectorScreen("Stop Container", items),
+            lambda n: self._docker_action("stop", n),
+        )
+
+    def action_docker_restart(self) -> None:
+        items = self._docker_items(status_filter="running")
+        if not items:
+            self.notify("No running containers", severity="warning")
+            return
+        self.push_screen(
+            SelectorScreen("Restart Container", items),
+            lambda n: self._docker_action("restart", n),
+        )
+
+    def action_refresh(self) -> None:
+        bg_fetch_cheap()
+        self._render_ui()
+        self._start_bg_fetch()
+        self.notify("Refreshed")
+
+
+if __name__ == "__main__":
+    app = ServerTUI()
+    app.run()
