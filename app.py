@@ -969,6 +969,7 @@ class ServerTUI(App):
         Binding("3", "show_tab('tab-ollama')", "Ollama"),
         Binding("4", "show_tab('tab-timers')", "Timers"),
         Binding("5", "show_tab('tab-apps')", "Apps"),
+        Binding("L", "app_logs", "App logs"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -1175,6 +1176,37 @@ class ServerTUI(App):
             self.notify("No timers found", severity="warning")
             return
         self.push_screen(SelectorScreen("View Timer Logs", items), callback)
+
+    # ── App actions ──
+
+    def _app_items(self) -> list[tuple[str, str]]:
+        items = []
+        for a in STORE.get("apps") or []:
+            if a.container_status == "running":
+                icon = "🟢"
+            elif a.container_status == "stopped":
+                icon = "🟡"
+            else:
+                icon = "⚫"
+            items.append((a.name, f"{icon} {a.name} ({a.container_status})"))
+        return items
+
+    def action_app_logs(self) -> None:
+        items = self._app_items()
+        if not items:
+            self.notify("No apps configured", severity="warning")
+            return
+
+        def callback(name: str | None) -> None:
+            if name is None:
+                return
+            container = f"servertui-{name}"
+            self.push_screen(LogScreen(
+                f"Logs: {container}",
+                f"docker logs --tail 200 {shlex.quote(container)}",
+            ))
+
+        self.push_screen(SelectorScreen("View App Logs", items), callback)
 
     def action_show_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
