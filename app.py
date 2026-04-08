@@ -499,6 +499,7 @@ class DataStore:
 
 
 STORE = DataStore()
+REBUILD_LOCK = Lock()
 
 
 def bg_fetch_expensive():
@@ -513,6 +514,114 @@ def bg_fetch_cheap():
     STORE.fetch_tunnels()
     STORE.fetch_timers()
     STORE.fetch_apps()
+
+
+def rebuild_app(app: "App"):
+    """Generator that yields output lines from git pull + build + restart.
+    Final yielded value is a string '[exit 0]' or '[exit N]'."""
+    container = f"servertui-{app.name}"
+    env_path = ENV_DIR / f"{app.name}.env"
+
+    if not app.repo_path.is_dir():
+        yield f"[red]repo path does not exist: {app.repo_path}[/]"
+        yield "[exit 1]"
+        return
+
+    mode = detect_build_mode(app.repo_path)
+    if mode == "none":
+        yield "[red]no Dockerfile or compose.yml in repo[/]"
+        yield "[exit 1]"
+        return
+
+    if env_path.exists():
+        st = env_path.stat()
+        if (st.st_mode & 0o777) != 0o600:
+            yield f"[red]env file perms looser than 600: {env_path}[/]"
+            yield "[red]fix with: chmod 600 {}[/]".format(env_path)
+            yield "[exit 1]"
+            return
+
+    def stream(cmd: list[str], cwd: Path | None = None):
+        yield f"[dim]$ {' '.join(shlex.quote(c) for c in cmd)}[/]"
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(cwd) if cwd else None,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except OSError as e:
+            yield f"[red]failed to spawn: {e}[/]"
+            yield 1
+            return
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            yield line.rstrip()
+        proc.wait()
+        yield proc.returncode
+
+    # 1. git pull --ff-only
+    rc = None
+    for item in stream(["git", "pull", "--ff-only"], cwd=app.repo_path):
+        if isinstance(item, int):
+            rc = item
+        else:
+            yield item
+    if rc != 0:
+        yield "[red]git pull failed — aborting[/]"
+        yield f"[exit {rc}]"
+        return
+
+    # 2. Build + restart
+    if mode == "dockerfile":
+        image_tag = f"servertui-{app.name}"
+        rc = None
+        for item in stream(["docker", "build", "-t", image_tag, "."], cwd=app.repo_path):
+            if isinstance(item, int):
+                rc = item
+            else:
+                yield item
+        if rc != 0:
+            yield "[red]docker build failed — existing container untouched[/]"
+            yield f"[exit {rc}]"
+            return
+
+        yield "[dim]$ docker rm -f {}[/]".format(container)
+        subprocess.run(["docker", "rm", "-f", container],
+                       capture_output=True, text=True)
+
+        run_cmd_list = [
+            "docker", "run", "-d",
+            "--name", container,
+            "--restart", "unless-stopped",
+        ]
+        if env_path.exists():
+            run_cmd_list += ["--env-file", str(env_path)]
+        run_cmd_list.append(image_tag)
+
+        rc = None
+        for item in stream(run_cmd_list):
+            if isinstance(item, int):
+                rc = item
+            else:
+                yield item
+        yield f"[exit {rc}]"
+        return
+
+    # compose mode
+    compose_file = app.repo_path / "compose.yml"
+    if not compose_file.exists():
+        compose_file = app.repo_path / "docker-compose.yml"
+    cmd = ["docker", "compose", "-f", str(compose_file)]
+    if env_path.exists():
+        cmd += ["--env-file", str(env_path)]
+    cmd += ["up", "-d", "--build"]
+    rc = None
+    for item in stream(cmd, cwd=app.repo_path):
+        if isinstance(item, int):
+            rc = item
+        else:
+            yield item
+    yield f"[exit {rc}]"
 
 
 # ─── Widgets ─────────────────────────────────────────────────────────
@@ -872,6 +981,41 @@ class LogScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class BuildScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close")]
+
+    def __init__(self, title: str, app_cfg: "App") -> None:
+        super().__init__()
+        self.title_text = title
+        self.app_cfg = app_cfg
+
+    def compose(self) -> ComposeResult:
+        with Container(id="log-box"):
+            yield Static(
+                f"[bold]{self.title_text}[/]  [dim]Press ESC or q to close[/]\n",
+                id="log-title",
+            )
+            yield RichLog(id="log-view", wrap=True, highlight=False, markup=True)
+
+    def on_mount(self) -> None:
+        Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        log_view = self.query_one("#log-view", RichLog)
+        try:
+            for line in rebuild_app(self.app_cfg):
+                self.app.call_from_thread(log_view.write, line)
+        finally:
+            REBUILD_LOCK.release()
+            self.app.call_from_thread(bg_fetch_cheap)
+            self.app.call_from_thread(
+                self.app.query_one("#apps-panel", AppPanel).refresh_data
+            )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 # ─── Main App ────────────────────────────────────────────────────────
 
 class ServerTUI(App):
@@ -951,7 +1095,7 @@ class ServerTUI(App):
 
     #log-view { height: 1fr; }
 
-    SelectorScreen, LogScreen { align: center middle; }
+    SelectorScreen, LogScreen, BuildScreen { align: center middle; }
     """
 
     BINDINGS = [
@@ -970,6 +1114,7 @@ class ServerTUI(App):
         Binding("4", "show_tab('tab-timers')", "Timers"),
         Binding("5", "show_tab('tab-apps')", "Apps"),
         Binding("L", "app_logs", "App logs"),
+        Binding("R", "app_rebuild", "Rebuild app"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -1207,6 +1352,41 @@ class ServerTUI(App):
             ))
 
         self.push_screen(SelectorScreen("View App Logs", items), callback)
+
+    def action_app_rebuild(self) -> None:
+        items = self._app_items()
+        if not items:
+            self.notify("No apps configured", severity="warning")
+            return
+
+        def launch(name: str | None) -> None:
+            if name is None:
+                return
+            app_cfg = next((a for a in APPS if a.name == name), None)
+            if app_cfg is None:
+                return
+            info = next(
+                (i for i in (STORE.get("apps") or []) if i.name == name), None,
+            )
+
+            def start() -> None:
+                if not REBUILD_LOCK.acquire(blocking=False):
+                    self.notify("A rebuild is already in progress", severity="warning")
+                    return
+                self.push_screen(BuildScreen(f"Rebuild: {name}", app_cfg))
+
+            if info and info.git_state == "dirty":
+                self.push_screen(
+                    SelectorScreen(
+                        f"{name}: repo is DIRTY — rebuild anyway?",
+                        [("yes", "✅ yes, rebuild"), ("no", "❌ cancel")],
+                    ),
+                    lambda choice: start() if choice == "yes" else None,
+                )
+            else:
+                start()
+
+        self.push_screen(SelectorScreen("Rebuild App", items), launch)
 
     def action_show_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
