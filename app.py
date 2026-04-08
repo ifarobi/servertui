@@ -13,7 +13,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from threading import Thread, Lock
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import docker
