@@ -5,6 +5,7 @@ Docker containers, and monitoring system resources.
 
 import os
 import re
+import socket
 import subprocess
 import shlex
 import json
@@ -650,7 +651,7 @@ class LogScreen(ModalScreen[None]):
 
 class ServerTUI(App):
     TITLE = "ServerTUI"
-    SUB_TITLE = "ifr-ser5"
+    SUB_TITLE = socket.gethostname()
 
     CSS = """
     Screen {
