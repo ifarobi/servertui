@@ -18,7 +18,7 @@ from pathlib import Path
 
 import docker
 import psutil
-from textual.app import App, ComposeResult
+from textual.app import App as TextualApp, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
@@ -1090,7 +1090,7 @@ class BuildScreen(ModalScreen[None]):
 
 # ─── Main App ────────────────────────────────────────────────────────
 
-class ServerTUI(App):
+class ServerTUI(TextualApp):
     TITLE = "ServerTUI"
     SUB_TITLE = socket.gethostname()
 
