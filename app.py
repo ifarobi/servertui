@@ -175,6 +175,7 @@ class DataStore:
             "timers": [],
             "docker": [],
             "ollama": {},
+            "apps": [],
         }
 
     def get(self, key: str):
