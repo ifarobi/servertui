@@ -13,6 +13,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from threading import Thread, Lock
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import docker
 import psutil
@@ -35,6 +37,33 @@ from textual.widgets import (
 ## Tunnels are auto-discovered from `cloudflared-*.service` user units.
 ## Add entries here only to override description/domain or pin ordering.
 TUNNELS: list[dict] = []
+
+## Apps are locally-cloned repos that ServerTUI can manually rebuild and whose
+## env files it manages. Each app owns exactly one container named
+## `servertui-<name>`. ServerTUI will never touch containers it didn't name.
+@dataclass(frozen=True)
+class App:
+    name: str               # display name; container will be servertui-<name>
+    repo_path: Path         # absolute path to a local git clone
+    tunnel: str | None = None  # optional cross-reference to a TUNNELS service name
+
+APPS: list[App] = []
+
+ENV_DIR = Path.home() / ".config" / "servertui" / "env"
+
+
+@dataclass
+class AppInfo:
+    name: str
+    container_status: str          # "running" | "stopped" | "missing"
+    image: str | None
+    uptime: str | None
+    tunnel: str | None
+    tunnel_status: str | None      # "active" | "inactive" | None
+    git_state: str                 # "clean" | "dirty" | f"behind {n}" | "?"
+    env_key_count: int | None      # None if file missing
+    env_perms_ok: bool             # True if file missing OR mode == 0o600
+    build_mode: str                # "dockerfile" | "compose" | "none"
 
 OLLAMA_BASE = "http://localhost:11434"
 
