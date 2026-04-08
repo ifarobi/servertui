@@ -137,6 +137,72 @@ def bar(percent: float, width: int = 20) -> str:
     return f"[{color}]{'█' * filled}{'░' * empty}[/]"
 
 
+def inspect_env_file(path: Path) -> tuple[int | None, bool]:
+    """Return (key_count, perms_ok). key_count is None if file missing.
+    perms_ok is True when the file is missing OR its mode is exactly 0o600."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return (None, True)
+    except OSError:
+        return (None, False)
+    perms_ok = (st.st_mode & 0o777) == 0o600
+    try:
+        count = 0
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if "=" in s:
+                    count += 1
+        return (count, perms_ok)
+    except OSError:
+        return (None, perms_ok)
+
+
+def detect_build_mode(repo_path: Path) -> str:
+    """Return 'compose', 'dockerfile', or 'none'."""
+    if not repo_path.is_dir():
+        return "none"
+    if (repo_path / "compose.yml").exists() or (repo_path / "docker-compose.yml").exists():
+        return "compose"
+    if (repo_path / "Dockerfile").exists():
+        return "dockerfile"
+    return "none"
+
+
+def git_state(repo_path: Path) -> str:
+    """Cheap best-effort git state: 'clean' / 'dirty' / 'behind N' / '?'."""
+    if not (repo_path / ".git").exists():
+        return "?"
+    try:
+        porcelain = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if porcelain.returncode != 0:
+            return "?"
+        dirty = bool(porcelain.stdout.strip())
+        behind = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-list", "--count", "HEAD..@{u}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        n_behind = 0
+        if behind.returncode == 0:
+            try:
+                n_behind = int(behind.stdout.strip() or "0")
+            except ValueError:
+                n_behind = 0
+        if dirty:
+            return "dirty"
+        if n_behind > 0:
+            return f"behind {n_behind}"
+        return "clean"
+    except (subprocess.TimeoutExpired, OSError):
+        return "?"
+
+
 def get_uptime() -> str:
     boot = datetime.fromtimestamp(psutil.boot_time())
     delta = datetime.now() - boot
@@ -356,6 +422,81 @@ class DataStore:
             "running": ps.get("models", []) if ps else [],
         })
 
+    def fetch_apps(self):
+        """Snapshot state of every configured app. Cheap: stat + 2 git + 1 docker inspect per app."""
+        tunnels = self._data.get("tunnels") or []
+        tunnel_status_by_service = {}
+        for t in tunnels:
+            state = t.get("ActiveState", "unknown")
+            sub = t.get("SubState", "unknown")
+            tunnel_status_by_service[t.get("service", "")] = (
+                "active" if (state == "active" and sub == "running") else "inactive"
+            )
+
+        try:
+            client = docker.from_env()
+            docker_ok = True
+        except Exception:
+            client = None
+            docker_ok = False
+
+        out: list[AppInfo] = []
+        for app in APPS:
+            container_name = f"servertui-{app.name}"
+            status = "missing"
+            image = None
+            uptime = None
+            if docker_ok:
+                try:
+                    c = client.containers.get(container_name)
+                    status = "running" if c.status == "running" else "stopped"
+                    image = (c.image.tags[0] if c.image.tags else c.image.short_id)
+                    started = c.attrs.get("State", {}).get("StartedAt", "")
+                    if started and status == "running":
+                        try:
+                            dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                            delta = datetime.now(dt.tzinfo) - dt
+                            secs = int(delta.total_seconds())
+                            if secs < 60:
+                                uptime = f"{secs}s"
+                            elif secs < 3600:
+                                uptime = f"{secs // 60}m"
+                            elif secs < 86400:
+                                uptime = f"{secs // 3600}h"
+                            else:
+                                uptime = f"{secs // 86400}d"
+                        except Exception:
+                            uptime = None
+                except docker.errors.NotFound:
+                    status = "missing"
+                except Exception:
+                    status = "missing"
+
+            env_path = ENV_DIR / f"{app.name}.env"
+            env_count, env_perms_ok = inspect_env_file(env_path)
+
+            tunnel_service = (
+                f"cloudflared-{app.tunnel}.service" if app.tunnel else None
+            )
+            tunnel_status = (
+                tunnel_status_by_service.get(tunnel_service) if tunnel_service else None
+            )
+
+            out.append(AppInfo(
+                name=app.name,
+                container_status=status,
+                image=image,
+                uptime=uptime,
+                tunnel=app.tunnel,
+                tunnel_status=tunnel_status,
+                git_state=git_state(app.repo_path),
+                env_key_count=env_count,
+                env_perms_ok=env_perms_ok,
+                build_mode=detect_build_mode(app.repo_path),
+            ))
+
+        self.set("apps", out)
+
 
 STORE = DataStore()
 
@@ -371,6 +512,7 @@ def bg_fetch_cheap():
     STORE.fetch_system()
     STORE.fetch_tunnels()
     STORE.fetch_timers()
+    STORE.fetch_apps()
 
 
 # ─── Widgets ─────────────────────────────────────────────────────────
