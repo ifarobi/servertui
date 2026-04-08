@@ -3,6 +3,8 @@ ServerTUI — Local server dashboard for managing Cloudflare tunnels,
 Docker containers, and monitoring system resources.
 """
 
+import os
+import re
 import subprocess
 import shlex
 import json
@@ -27,26 +29,9 @@ from textual.widgets import (
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-TUNNELS = [
-    {
-        "name": "coloring",
-        "service": "cloudflared-coloring",
-        "domain": "coloring.cafe",
-        "description": "Coloring Cafe",
-    },
-    {
-        "name": "noko",
-        "service": "cloudflared-noko",
-        "domain": "noko.ifarobi.com",
-        "description": "Noko POS",
-    },
-    {
-        "name": "ollage",
-        "service": "cloudflared-ollage",
-        "domain": "ollage.ifarobi.com",
-        "description": "Ollage Photo Collage",
-    },
-]
+## Tunnels are auto-discovered from `cloudflared-*.service` user units.
+## Add entries here only to override description/domain or pin ordering.
+TUNNELS: list[dict] = []
 
 OLLAMA_BASE = "http://localhost:11434"
 
@@ -65,6 +50,37 @@ def run_cmd(cmd: str, timeout: int = 5) -> str:
 
 def systemctl_user(action: str, service: str) -> str:
     return run_cmd(f"systemctl --user {action} {service}")
+
+
+def detect_tunnel_domain(service: str) -> str:
+    """Best-effort hostname extraction from a cloudflared unit's config file."""
+    raw = run_cmd(f"systemctl --user show {service} --property=ExecStart --no-pager")
+    m = re.search(r"--config[= ]([^\s;]+)", raw)
+    candidates = []
+    if m:
+        candidates.append(m.group(1))
+    home = os.path.expanduser("~")
+    candidates += [
+        f"{home}/.cloudflared/{service.removeprefix('cloudflared-')}.yml",
+        f"{home}/.cloudflared/config.yml",
+        f"/etc/cloudflared/{service.removeprefix('cloudflared-')}.yml",
+        "/etc/cloudflared/config.yml",
+    ]
+    seen = set()
+    for path in candidates:
+        if not path or path in seen or not os.path.isfile(path):
+            seen.add(path)
+            continue
+        seen.add(path)
+        try:
+            with open(path) as f:
+                for line in f:
+                    hm = re.search(r"hostname:\s*([^\s#]+)", line)
+                    if hm:
+                        return hm.group(1).strip("\"'")
+        except OSError:
+            continue
+    return ""
 
 
 def fmt_bytes(n: int | float) -> str:
@@ -161,11 +177,32 @@ class DataStore:
         })
 
     def fetch_tunnels(self):
-        """Fetch tunnel statuses (cheap, ~instant)."""
+        """Fetch tunnel statuses (cheap, ~instant).
+
+        Auto-discovers any cloudflared-*.service user unit. Entries in the
+        TUNNELS constant act as optional metadata overlays (description/domain)
+        keyed by service name.
+        """
+        meta = {t["service"]: t for t in TUNNELS}
+
+        raw_units = run_cmd(
+            "systemctl --user list-unit-files 'cloudflared-*.service' "
+            "--no-legend --no-pager"
+        )
+        services = []
+        for line in raw_units.splitlines():
+            parts = line.split()
+            if parts and parts[0].endswith(".service"):
+                services.append(parts[0][: -len(".service")])
+
+        # Preserve TUNNELS ordering first, then any extras discovered.
+        ordered = [t["service"] for t in TUNNELS if t["service"] in services]
+        ordered += [s for s in services if s not in ordered]
+
         tunnels = []
-        for t in TUNNELS:
+        for service in ordered:
             raw = run_cmd(
-                f"systemctl --user show {t['service']} "
+                f"systemctl --user show {service} "
                 "--property=ActiveState,SubState,MainPID,MemoryCurrent "
                 "--no-pager"
             )
@@ -174,7 +211,13 @@ class DataStore:
                 if "=" in line:
                     k, v = line.split("=", 1)
                     info[k] = v
-            tunnels.append({**t, **info})
+            base = meta.get(service) or {
+                "name": service.removeprefix("cloudflared-"),
+                "service": service,
+                "domain": detect_tunnel_domain(service),
+                "description": service.removeprefix("cloudflared-").title(),
+            }
+            tunnels.append({**base, **info})
         self.set("tunnels", tunnels)
 
     def fetch_docker(self):
@@ -266,19 +309,19 @@ class SystemPanel(Static):
         disk = s["disk"]
 
         self.query_one("#sys-content", Static).update(
-            f"[bold cyan]═══ System Resources ═══[/]\n\n"
-            f"  [bold]Uptime:[/]     {s['uptime']}\n"
-            f"  [bold]Load:[/]       {s['load'][0]:.2f}  {s['load'][1]:.2f}  {s['load'][2]:.2f}\n\n"
-            f"  [bold cyan]CPU[/]        {bar(s['cpu_percent'])}  {s['cpu_percent']:5.1f}%\n"
-            f"               {s['cpu_count']} cores @ {s['cpu_freq']}\n\n"
-            f"  [bold green]RAM[/]        {bar(mem.percent)}  {mem.percent:5.1f}%\n"
-            f"               {fmt_bytes(mem.used)} / {fmt_bytes(mem.total)}\n\n"
-            f"  [bold yellow]Swap[/]       {bar(swap.percent)}  {swap.percent:5.1f}%\n"
-            f"               {fmt_bytes(swap.used)} / {fmt_bytes(swap.total)}\n\n"
-            f"  [bold magenta]Disk /[/]     {bar(disk.percent)}  {disk.percent:5.1f}%\n"
-            f"               {fmt_bytes(disk.used)} / {fmt_bytes(disk.total)}\n\n"
-            f"  [bold blue]Net ↑[/]      {fmt_bytes(s['net_sent'])}\n"
-            f"  [bold blue]Net ↓[/]      {fmt_bytes(s['net_recv'])}\n"
+            f"[bold cyan]═══ 🖥️  System Resources ═══[/]\n\n"
+            f"  ⏱️  [bold]Uptime:[/]  {s['uptime']}\n"
+            f"  📊 [bold]Load:[/]    {s['load'][0]:.2f}  {s['load'][1]:.2f}  {s['load'][2]:.2f}\n\n"
+            f"  🧠 [bold cyan]CPU[/]     {bar(s['cpu_percent'])}  {s['cpu_percent']:5.1f}%\n"
+            f"            {s['cpu_count']} cores @ {s['cpu_freq']}\n\n"
+            f"  💾 [bold green]RAM[/]     {bar(mem.percent)}  {mem.percent:5.1f}%\n"
+            f"            {fmt_bytes(mem.used)} / {fmt_bytes(mem.total)}\n\n"
+            f"  🔁 [bold yellow]Swap[/]    {bar(swap.percent)}  {swap.percent:5.1f}%\n"
+            f"            {fmt_bytes(swap.used)} / {fmt_bytes(swap.total)}\n\n"
+            f"  💽 [bold magenta]Disk /[/]  {bar(disk.percent)}  {disk.percent:5.1f}%\n"
+            f"            {fmt_bytes(disk.used)} / {fmt_bytes(disk.total)}\n\n"
+            f"  ⬆️  [bold blue]Net ↑[/]   {fmt_bytes(s['net_sent'])}\n"
+            f"  ⬇️  [bold blue]Net ↓[/]   {fmt_bytes(s['net_recv'])}\n"
         )
 
 
@@ -292,7 +335,7 @@ class TunnelPanel(Static):
             self.query_one("#tunnel-content", Static).update("[dim]Loading...[/]")
             return
 
-        lines = ["[bold cyan]═══ Cloudflare Tunnels ═══[/]\n"]
+        lines = ["[bold cyan]═══ ☁️  Cloudflare Tunnels ═══[/]\n"]
         for t in tunnels:
             state = t.get("ActiveState", "unknown")
             sub = t.get("SubState", "unknown")
@@ -300,13 +343,13 @@ class TunnelPanel(Static):
             mem_raw = t.get("MemoryCurrent", "[not set]")
 
             if state == "active" and sub == "running":
-                icon = "[bold green]●[/]"
+                icon = "🟢"
                 status_str = "[green]running[/]"
             elif state == "active":
-                icon = "[bold yellow]●[/]"
+                icon = "🟡"
                 status_str = f"[yellow]{sub}[/]"
             else:
-                icon = "[bold red]●[/]"
+                icon = "🔴"
                 status_str = f"[red]{state}[/]"
 
             try:
@@ -314,12 +357,13 @@ class TunnelPanel(Static):
             except (ValueError, TypeError):
                 mem_str = "N/A"
 
+            domain = t.get("domain") or "[dim]—[/]"
             lines.append(
                 f"  {icon}  [bold]{t['description']:<24}[/] {status_str}\n"
-                f"       {t['domain']:<28} PID {pid:<8} RAM {mem_str}\n"
+                f"       🌐 {domain:<26} 🆔 {pid:<6} 💾 {mem_str}\n"
             )
 
-        lines.append("[dim]  Keys: [bold]s[/]=start  [bold]t[/]=stop  [bold]r[/]=restart  [bold]l[/]=logs[/]")
+        lines.append("[dim]  ⌨  [bold]s[/]=start  [bold]t[/]=stop  [bold]r[/]=restart  [bold]l[/]=logs[/]")
         self.query_one("#tunnel-content", Static).update("\n".join(lines))
 
 
@@ -329,12 +373,12 @@ class DockerPanel(Static):
 
     def refresh_data(self) -> None:
         containers = STORE.get("docker")
-        lines = ["[bold cyan]═══ Docker Containers ═══[/]\n"]
+        lines = ["[bold cyan]═══ 🐳 Docker Containers ═══[/]\n"]
 
         if containers is None:
-            lines.append("  [red]Docker daemon not reachable[/]")
+            lines.append("  ⚠️  [red]Docker daemon not reachable[/]")
         elif not containers:
-            lines.append("  [dim]No containers found[/]")
+            lines.append("  [dim]📭 No containers found[/]")
         else:
             for c in containers:
                 name = c["name"]
@@ -342,7 +386,7 @@ class DockerPanel(Static):
                 image = c["image"]
 
                 if status == "running":
-                    icon = "[bold green]●[/]"
+                    icon = "🟢"
                     status_str = f"[green]{status}[/]"
                     mem_str = (
                         f"{fmt_bytes(c['mem_usage'])} / {fmt_bytes(c['mem_limit'])}"
@@ -350,17 +394,17 @@ class DockerPanel(Static):
                     )
                     lines.append(
                         f"  {icon}  [bold]{name:<28}[/] {status_str}\n"
-                        f"       {image}\n"
-                        f"       CPU: {c['cpu_pct']:.1f}%   RAM: {mem_str}\n"
+                        f"       📦 {image}\n"
+                        f"       🧠 CPU {c['cpu_pct']:.1f}%   💾 RAM {mem_str}\n"
                     )
                 else:
-                    icon = "[bold red]●[/]"
+                    icon = "🔴"
                     lines.append(
                         f"  {icon}  [bold]{name:<28}[/] [red]{status}[/]\n"
-                        f"       {image}\n"
+                        f"       📦 {image}\n"
                     )
 
-        lines.append("[dim]  Keys: [bold]u[/]=start  [bold]d[/]=stop  [bold]x[/]=restart[/]")
+        lines.append("[dim]  ⌨  [bold]u[/]=start  [bold]d[/]=stop  [bold]x[/]=restart[/]")
         self.query_one("#docker-content", Static).update("\n".join(lines))
 
 
@@ -370,18 +414,18 @@ class OllamaPanel(Static):
 
     def refresh_data(self) -> None:
         status = STORE.get("ollama") or {}
-        lines = ["[bold cyan]═══ Ollama LLM ═══[/]\n"]
+        lines = ["[bold cyan]═══ 🦙 Ollama LLM ═══[/]\n"]
 
         if not status.get("online"):
-            lines.append("  [red]● Offline[/]  [dim]Ollama not running[/]\n")
+            lines.append("  🔴 [red]Offline[/]  [dim]Ollama not running[/]\n")
             self.query_one("#ollama-content", Static).update("\n".join(lines))
             return
 
-        lines.append(f"  [green]● Online[/]  v{status['version']}\n")
+        lines.append(f"  🟢 [green]Online[/]  v{status['version']}\n")
 
         running = status.get("running", [])
         if running:
-            lines.append("  [bold green]Loaded in memory:[/]")
+            lines.append("  ⚡ [bold green]Loaded in memory:[/]")
             for m in running:
                 name = m.get("name", "?")
                 size = m.get("size", 0)
@@ -421,14 +465,14 @@ class OllamaPanel(Static):
                     lines.append(f"    {' · '.join(parts)}")
                 lines.append("")
         else:
-            lines.append("  [dim]No models loaded in memory[/]\n")
+            lines.append("  [dim]💤 No models loaded in memory[/]\n")
 
         models = status.get("models", [])
         running_names = {m.get("name") for m in running}
         installed = [m for m in models if m.get("name") not in running_names]
 
         if installed:
-            lines.append(f"  [bold]Installed ({len(models)} total):[/]")
+            lines.append(f"  📚 [bold]Installed ({len(models)} total):[/]")
             for m in installed:
                 name = m.get("name", "?")
                 size = m.get("size", 0)
