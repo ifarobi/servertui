@@ -624,6 +624,42 @@ def rebuild_app(app: "App"):
     yield f"[exit {rc}]"
 
 
+def edit_env_file(app_cfg: "App") -> tuple[bool, str | None]:
+    """Open the app's env file in $EDITOR. Creates it 0600 if missing.
+    Returns (changed, error). `changed` is True iff mtime advanced."""
+    try:
+        ENV_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(ENV_DIR, 0o700)
+    except OSError as e:
+        return (False, f"cannot create {ENV_DIR}: {e}")
+
+    path = ENV_DIR / f"{app_cfg.name}.env"
+    if not path.exists():
+        try:
+            path.touch(mode=0o600)
+        except OSError as e:
+            return (False, f"cannot create {path}: {e}")
+    else:
+        st = path.stat()
+        if (st.st_mode & 0o777) != 0o600:
+            return (False, f"refusing to edit: {path} has perms "
+                           f"{oct(st.st_mode & 0o777)}, expected 0o600")
+
+    editor = os.environ.get("EDITOR") or "nano"
+    before = path.stat().st_mtime
+
+    try:
+        proc = subprocess.run([editor, str(path)])
+    except FileNotFoundError:
+        return (False, f"editor not found: {editor} (set $EDITOR)")
+
+    if proc.returncode != 0:
+        return (False, f"{editor} exited with code {proc.returncode}")
+
+    after = path.stat().st_mtime
+    return (after > before, None)
+
+
 # ─── Widgets ─────────────────────────────────────────────────────────
 
 class SystemPanel(Static):
@@ -1115,6 +1151,7 @@ class ServerTUI(App):
         Binding("5", "show_tab('tab-apps')", "Apps"),
         Binding("L", "app_logs", "App logs"),
         Binding("R", "app_rebuild", "Rebuild app"),
+        Binding("E", "app_edit_env", "Edit env"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -1387,6 +1424,59 @@ class ServerTUI(App):
                 start()
 
         self.push_screen(SelectorScreen("Rebuild App", items), launch)
+
+    def action_app_edit_env(self) -> None:
+        items = self._app_items()
+        if not items:
+            self.notify("No apps configured", severity="warning")
+            return
+
+        def on_selected(name: str | None) -> None:
+            if name is None:
+                return
+            app_cfg = next((a for a in APPS if a.name == name), None)
+            if app_cfg is None:
+                return
+
+            with self.suspend():
+                changed, err = edit_env_file(app_cfg)
+
+            bg_fetch_cheap()
+            self._render_ui()
+
+            if err:
+                self.notify(err, severity="error")
+                return
+            if not changed:
+                self.notify(f"{name}: env unchanged")
+                return
+
+            def maybe_restart(choice: str | None) -> None:
+                if choice != "yes":
+                    return
+                container = f"servertui-{name}"
+                try:
+                    client = docker.from_env()
+                    client.containers.get(container).restart()
+                    self.notify(f"Restarted {container}")
+                except docker.errors.NotFound:
+                    self.notify(
+                        f"{container} not running — press R to rebuild",
+                        severity="warning",
+                    )
+                except Exception as e:
+                    self.notify(f"Restart failed: {e}", severity="error")
+                self._start_bg_fetch()
+
+            self.push_screen(
+                SelectorScreen(
+                    f"{name}: env updated — restart container?",
+                    [("yes", "✅ yes, restart now"), ("no", "❌ no")],
+                ),
+                maybe_restart,
+            )
+
+        self.push_screen(SelectorScreen("Edit App Env", items), on_selected)
 
     def action_show_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
