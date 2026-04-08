@@ -529,7 +529,7 @@ class DataStore:
             env_count, env_perms_ok = inspect_env_file(env_path)
 
             tunnel_service = (
-                f"cloudflared-{app.tunnel}.service" if app.tunnel else None
+                f"cloudflared-{app.tunnel}" if app.tunnel else None
             )
             tunnel_status = (
                 tunnel_status_by_service.get(tunnel_service) if tunnel_service else None
