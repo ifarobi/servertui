@@ -9,6 +9,7 @@ import socket
 import subprocess
 import shlex
 import json
+import sys
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -41,15 +42,57 @@ TUNNELS: list[dict] = []
 ## Apps are locally-cloned repos that ServerTUI can manually rebuild and whose
 ## env files it manages. Each app owns exactly one container named
 ## `servertui-<name>`. ServerTUI will never touch containers it didn't name.
+##
+## Configured via ~/.config/servertui/apps.json (see apps.example.json in repo).
 @dataclass(frozen=True)
 class App:
     name: str               # display name; container will be servertui-<name>
     repo_path: Path         # absolute path to a local git clone
     tunnel: str | None = None  # bare tunnel name, e.g. "foo" (NOT "cloudflared-foo.service")
 
-APPS: list[App] = []
 
-ENV_DIR = Path.home() / ".config" / "servertui" / "env"
+CONFIG_DIR = Path.home() / ".config" / "servertui"
+APPS_CONFIG = CONFIG_DIR / "apps.json"
+ENV_DIR = CONFIG_DIR / "env"
+
+
+def load_apps() -> list[App]:
+    """Load apps from ~/.config/servertui/apps.json. Missing file → []."""
+    if not APPS_CONFIG.exists():
+        return []
+    try:
+        raw = json.loads(APPS_CONFIG.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[servertui] failed to read {APPS_CONFIG}: {e}", file=sys.stderr)
+        return []
+    if not isinstance(raw, list):
+        print(f"[servertui] {APPS_CONFIG}: expected a JSON array", file=sys.stderr)
+        return []
+    out: list[App] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: not an object, skipping", file=sys.stderr)
+            continue
+        name = entry.get("name")
+        repo_path = entry.get("repo_path")
+        if not isinstance(name, str) or not isinstance(repo_path, str):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: missing 'name' or 'repo_path', skipping",
+                  file=sys.stderr)
+            continue
+        tunnel = entry.get("tunnel")
+        if tunnel is not None and not isinstance(tunnel, str):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: 'tunnel' must be a string, skipping",
+                  file=sys.stderr)
+            continue
+        out.append(App(
+            name=name,
+            repo_path=Path(repo_path).expanduser(),
+            tunnel=tunnel,
+        ))
+    return out
+
+
+APPS: list[App] = load_apps()
 
 
 @dataclass

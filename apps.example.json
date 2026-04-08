@@ -1,0 +1,11 @@
+[
+  {
+    "name": "foo",
+    "repo_path": "~/src/foo",
+    "tunnel": "foo"
+  },
+  {
+    "name": "bar",
+    "repo_path": "/srv/bar"
+  }
+]
