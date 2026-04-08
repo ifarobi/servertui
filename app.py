@@ -718,6 +718,59 @@ class OllamaPanel(Static):
         self.query_one("#ollama-content", Static).update("\n".join(lines))
 
 
+class AppPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="apps-content")
+
+    def refresh_data(self) -> None:
+        apps = STORE.get("apps") or []
+        lines = ["[bold cyan]═══ 📦 Apps ═══[/]\n"]
+
+        if not APPS:
+            lines.append("  [dim]No apps configured. Add entries to APPS in app.py.[/]")
+            self.query_one("#apps-content", Static).update("\n".join(lines))
+            return
+
+        for a in apps:
+            if a.container_status == "running":
+                icon = "🟢"
+                status_str = "[green]running[/]"
+            elif a.container_status == "stopped":
+                icon = "🟡"
+                status_str = "[yellow]stopped[/]"
+            else:
+                icon = "⚫"
+                status_str = "[dim]missing[/]"
+
+            head = f"  {icon}  [bold]{a.name:<24}[/] {status_str}"
+            if a.uptime:
+                head += f"  [dim]up {a.uptime}[/]"
+            lines.append(head)
+
+            if a.image:
+                lines.append(f"       📦 {a.image}")
+
+            mode_str = a.build_mode if a.build_mode != "none" else "[red]no Dockerfile/compose[/]"
+            lines.append(f"       🔧 {mode_str}   📁 git: {a.git_state}")
+
+            if a.tunnel:
+                t_icon = "🟢" if a.tunnel_status == "active" else "🔴"
+                lines.append(f"       ☁️  tunnel: {t_icon} {a.tunnel}")
+
+            if not a.env_perms_ok:
+                lines.append("       [red]⚠  env file perms looser than 600[/]")
+            elif a.env_key_count is None:
+                lines.append("       [dim]env: (no file)[/]")
+            else:
+                lines.append(f"       [dim]env: {a.env_key_count} keys[/]")
+            lines.append("")
+
+        lines.append(
+            "[dim]  ⌨  [bold]R[/]=rebuild  [bold]E[/]=edit env  [bold]L[/]=logs[/]"
+        )
+        self.query_one("#apps-content", Static).update("\n".join(lines))
+
+
 class TimerPanel(Static):
     def compose(self) -> ComposeResult:
         yield Static(id="timer-content")
@@ -915,6 +968,7 @@ class ServerTUI(App):
         Binding("2", "show_tab('tab-docker')", "Docker"),
         Binding("3", "show_tab('tab-ollama')", "Ollama"),
         Binding("4", "show_tab('tab-timers')", "Timers"),
+        Binding("5", "show_tab('tab-apps')", "Apps"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -932,6 +986,8 @@ class ServerTUI(App):
                     yield OllamaPanel(id="ollama-panel")
                 with TabPane("⏲️  Timers", id="tab-timers"):
                     yield TimerPanel(id="timer-panel")
+                with TabPane("📦 Apps", id="tab-apps"):
+                    yield AppPanel(id="apps-panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -971,6 +1027,7 @@ class ServerTUI(App):
         self.query_one("#docker-panel", DockerPanel).refresh_data()
         self.query_one("#ollama-panel", OllamaPanel).refresh_data()
         self.query_one("#timer-panel", TimerPanel).refresh_data()
+        self.query_one("#apps-panel", AppPanel).refresh_data()
 
     def on_resize(self) -> None:
         self._check_layout()
