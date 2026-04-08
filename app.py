@@ -45,7 +45,7 @@ TUNNELS: list[dict] = []
 class App:
     name: str               # display name; container will be servertui-<name>
     repo_path: Path         # absolute path to a local git clone
-    tunnel: str | None = None  # optional cross-reference to a TUNNELS service name
+    tunnel: str | None = None  # bare tunnel name, e.g. "foo" (NOT "cloudflared-foo.service")
 
 APPS: list[App] = []
 
@@ -611,10 +611,13 @@ def rebuild_app(app: "App"):
     compose_file = app.repo_path / "compose.yml"
     if not compose_file.exists():
         compose_file = app.repo_path / "docker-compose.yml"
-    cmd = ["docker", "compose", "-f", str(compose_file)]
     if env_path.exists():
-        cmd += ["--env-file", str(env_path)]
-    cmd += ["up", "-d", "--build"]
+        yield (
+            "[yellow]note: compose mode — ServerTUI's env file is NOT auto-wired.[/]\n"
+            "[yellow]Reference it in compose.yml via `env_file: "
+            f"{env_path}` or `${{VAR}}` interpolation.[/]"
+        )
+    cmd = ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"]
     rc = None
     for item in stream(cmd, cwd=app.repo_path):
         if isinstance(item, int):
@@ -656,8 +659,18 @@ def edit_env_file(app_cfg: "App") -> tuple[bool, str | None]:
     if proc.returncode != 0:
         return (False, f"{editor} exited with code {proc.returncode}")
 
-    after = path.stat().st_mtime
-    return (after > before, None)
+    # Re-check perms — some editors (or `:!chmod` inside vim) can drift them.
+    try:
+        st_after = path.stat()
+    except OSError as e:
+        return (False, f"cannot stat {path} after edit: {e}")
+    if (st_after.st_mode & 0o777) != 0o600:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as e:
+            return (False, f"{path} perms drifted to "
+                           f"{oct(st_after.st_mode & 0o777)} and chmod failed: {e}")
+    return (st_after.st_mtime > before, None)
 
 
 # ─── Widgets ─────────────────────────────────────────────────────────
@@ -1034,19 +1047,42 @@ class BuildScreen(ModalScreen[None]):
             yield RichLog(id="log-view", wrap=True, highlight=False, markup=True)
 
     def on_mount(self) -> None:
+        # Acquire the rebuild lock here (not in the caller) so that any failure
+        # in push_screen/compose/mount can't leave it held forever.
+        if not REBUILD_LOCK.acquire(blocking=False):
+            log_view = self.query_one("#log-view", RichLog)
+            log_view.write("[red]another rebuild is already in progress[/]")
+            return
         Thread(target=self._run, daemon=True).start()
 
     def _run(self) -> None:
-        log_view = self.query_one("#log-view", RichLog)
         try:
+            try:
+                log_view = self.query_one("#log-view", RichLog)
+            except Exception:
+                # Screen dismissed before thread started; drain generator for side effects.
+                for _ in rebuild_app(self.app_cfg):
+                    pass
+                return
             for line in rebuild_app(self.app_cfg):
-                self.app.call_from_thread(log_view.write, line)
+                try:
+                    self.app.call_from_thread(log_view.write, line)
+                except Exception:
+                    pass
         finally:
             REBUILD_LOCK.release()
-            self.app.call_from_thread(bg_fetch_cheap)
+            # Refresh on a background thread — bg_fetch_cheap does subprocess
+            # calls and would jank the UI if run inline.
+            Thread(target=self._post_build_refresh, daemon=True).start()
+
+    def _post_build_refresh(self) -> None:
+        bg_fetch_cheap()
+        try:
             self.app.call_from_thread(
                 self.app.query_one("#apps-panel", AppPanel).refresh_data
             )
+        except Exception:
+            pass
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1407,7 +1443,7 @@ class ServerTUI(App):
             )
 
             def start() -> None:
-                if not REBUILD_LOCK.acquire(blocking=False):
+                if REBUILD_LOCK.locked():
                     self.notify("A rebuild is already in progress", severity="warning")
                     return
                 self.push_screen(BuildScreen(f"Rebuild: {name}", app_cfg))
