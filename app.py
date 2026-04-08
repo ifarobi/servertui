@@ -17,7 +17,7 @@ import docker
 import psutil
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
@@ -25,6 +25,8 @@ from textual.widgets import (
     Header,
     RichLog,
     Static,
+    TabbedContent,
+    TabPane,
 )
 
 # ─── Config ──────────────────────────────────────────────────────────
@@ -140,6 +142,7 @@ class DataStore:
         self._data = {
             "system": {},
             "tunnels": [],
+            "timers": [],
             "docker": [],
             "ollama": {},
         }
@@ -220,6 +223,52 @@ class DataStore:
             tunnels.append({**base, **info})
         self.set("tunnels", tunnels)
 
+    def fetch_timers(self):
+        """Fetch systemd --user timers (cheap)."""
+        raw = run_cmd(
+            "systemctl --user list-timers --all --no-legend --no-pager"
+        )
+        timers = []
+        seen = set()
+        for line in raw.splitlines():
+            parts = line.split()
+            # Find the *.timer token; everything before it is time data,
+            # everything after is the activated unit(s).
+            unit_idx = next(
+                (i for i, p in enumerate(parts) if p.endswith(".timer")),
+                None,
+            )
+            if unit_idx is None:
+                continue
+            unit = parts[unit_idx]
+            if unit in seen:
+                continue
+            seen.add(unit)
+            activates = " ".join(parts[unit_idx + 1:]) or ""
+            time_parts = parts[:unit_idx]
+            # Split time_parts in half: first half = NEXT+LEFT, second = LAST+PASSED
+            mid = len(time_parts) // 2
+            entry = {
+                "next_left": " ".join(time_parts[:mid]),
+                "last_passed": " ".join(time_parts[mid:]),
+                "next": " ".join(time_parts[:mid]),
+                "left": "",
+                "last": " ".join(time_parts[mid:]),
+                "passed": "",
+                "unit": unit,
+                "activates": activates,
+            }
+            show = run_cmd(
+                f"systemctl --user show {entry['unit']} "
+                "--property=ActiveState,SubState,Description --no-pager"
+            )
+            for kv in show.splitlines():
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    entry[k] = v
+            timers.append(entry)
+        self.set("timers", timers)
+
     def fetch_docker(self):
         """Fetch docker container list + stats (EXPENSIVE — runs in bg)."""
         try:
@@ -290,6 +339,7 @@ def bg_fetch_cheap():
     """Fetch quick data (system + tunnels) — can run on main timer."""
     STORE.fetch_system()
     STORE.fetch_tunnels()
+    STORE.fetch_timers()
 
 
 # ─── Widgets ─────────────────────────────────────────────────────────
@@ -495,6 +545,47 @@ class OllamaPanel(Static):
         self.query_one("#ollama-content", Static).update("\n".join(lines))
 
 
+class TimerPanel(Static):
+    def compose(self) -> ComposeResult:
+        yield Static(id="timer-content")
+
+    def refresh_data(self) -> None:
+        timers = STORE.get("timers")
+        lines = ["[bold cyan]═══ ⏲️  Systemd Timers ═══[/]\n"]
+        if not timers:
+            lines.append("  [dim]📭 No timers found[/]")
+            self.query_one("#timer-content", Static).update("\n".join(lines))
+            return
+
+        for t in timers:
+            state = t.get("ActiveState", "unknown")
+            sub = t.get("SubState", "unknown")
+            if state == "failed" or sub == "failed":
+                icon = "🔴"
+            elif state == "active":
+                icon = "🟢"
+            else:
+                icon = "🟡"
+            unit = t["unit"]
+            desc = t.get("Description") or ""
+            activates = t.get("activates") or "—"
+            nxt = t.get("next") or "—"
+            left = t.get("left") or ""
+            last = t.get("last") or "—"
+            passed = t.get("passed") or ""
+            header = f"[bold]{desc}[/]" if desc else f"[bold]{unit}[/]"
+            sub_unit = f"       [dim]{unit}[/]\n" if desc else ""
+            lines.append(
+                f"  {icon}  {header}\n"
+                f"{sub_unit}"
+                f"       ▶ [dim]{activates}[/]\n"
+                f"       ⏭ next: {nxt}  [dim]({left})[/]\n"
+                f"       ⏮ last: {last}  [dim]({passed})[/]\n"
+            )
+        lines.append("[dim]  ⌨  [bold]g[/]=logs[/]")
+        self.query_one("#timer-content", Static).update("\n".join(lines))
+
+
 # ─── Modal screens ───────────────────────────────────────────────────
 
 class SelectorScreen(ModalScreen[str | None]):
@@ -511,8 +602,15 @@ class SelectorScreen(ModalScreen[str | None]):
             table = DataTable(id="selector-table")
             table.cursor_type = "row"
             table.add_columns("#", "Name")
+            seen_keys = set()
             for i, (key, label) in enumerate(self.items, 1):
-                table.add_row(str(i), label, key=key)
+                k = key
+                n = 1
+                while k in seen_keys:
+                    n += 1
+                    k = f"{key}#{n}"
+                seen_keys.add(k)
+                table.add_row(str(i), label, key=k)
             yield table
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -565,7 +663,7 @@ class ServerTUI(App):
 
     #left-col {
         width: 1fr;
-        max-width: 46;
+        max-width: 50;
         min-width: 36;
         border-right: solid $primary-background;
         padding: 1 2;
@@ -576,9 +674,8 @@ class ServerTUI(App):
         padding: 1 2;
     }
 
-    #tunnel-section { height: auto; padding-bottom: 1; }
-    #docker-section { height: auto; }
-    #ollama-section { height: auto; padding-top: 1; }
+    #tabs { height: 1fr; }
+    TabPane { padding: 1 2; }
 
     /* Narrow layout (<90 cols): stack vertically */
 
@@ -640,6 +737,11 @@ class ServerTUI(App):
         Binding("u", "docker_start", "Start container"),
         Binding("d", "docker_stop", "Stop container"),
         Binding("x", "docker_restart", "Restart container"),
+        Binding("g", "timer_logs", "Timer logs"),
+        Binding("1", "show_tab('tab-tunnels')", "Tunnels"),
+        Binding("2", "show_tab('tab-docker')", "Docker"),
+        Binding("3", "show_tab('tab-ollama')", "Ollama"),
+        Binding("4", "show_tab('tab-timers')", "Timers"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -648,13 +750,15 @@ class ServerTUI(App):
         with Horizontal(id="main-container"):
             with Vertical(id="left-col"):
                 yield SystemPanel(id="sys-panel")
-            with VerticalScroll(id="right-col"):
-                with Container(id="tunnel-section"):
+            with TabbedContent(id="tabs", initial="tab-tunnels"):
+                with TabPane("☁️  Tunnels", id="tab-tunnels"):
                     yield TunnelPanel(id="tunnel-panel")
-                with Container(id="docker-section"):
+                with TabPane("🐳 Docker", id="tab-docker"):
                     yield DockerPanel(id="docker-panel")
-                with Container(id="ollama-section"):
+                with TabPane("🦙 Ollama", id="tab-ollama"):
                     yield OllamaPanel(id="ollama-panel")
+                with TabPane("⏲️  Timers", id="tab-timers"):
+                    yield TimerPanel(id="timer-panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -693,6 +797,7 @@ class ServerTUI(App):
         self.query_one("#tunnel-panel", TunnelPanel).refresh_data()
         self.query_one("#docker-panel", DockerPanel).refresh_data()
         self.query_one("#ollama-panel", OllamaPanel).refresh_data()
+        self.query_one("#timer-panel", TimerPanel).refresh_data()
 
     def on_resize(self) -> None:
         self._check_layout()
@@ -804,6 +909,45 @@ class ServerTUI(App):
             SelectorScreen("Restart Container", items),
             lambda n: self._docker_action("restart", n),
         )
+
+    # ── Timer actions ──
+
+    def _timer_items(self) -> list[tuple[str, str]]:
+        items = []
+        for t in STORE.get("timers") or []:
+            state = t.get("ActiveState", "unknown")
+            sub = t.get("SubState", "unknown")
+            if state == "failed" or sub == "failed":
+                icon = "🔴"
+            elif state == "active":
+                icon = "🟢"
+            else:
+                icon = "🟡"
+            activates = t.get("activates") or "—"
+            items.append((t["unit"], f"{icon} {t['unit']} → {activates}"))
+        return items
+
+    def action_timer_logs(self) -> None:
+        def callback(unit: str | None) -> None:
+            if unit is None:
+                return
+            target = unit
+            for t in STORE.get("timers") or []:
+                if t["unit"] == unit and t.get("activates"):
+                    target = t["activates"]
+                    break
+            self.push_screen(LogScreen(
+                f"Logs: {target}",
+                f"journalctl --user -u {target} --no-pager -n 200",
+            ))
+        items = self._timer_items()
+        if not items:
+            self.notify("No timers found", severity="warning")
+            return
+        self.push_screen(SelectorScreen("View Timer Logs", items), callback)
+
+    def action_show_tab(self, tab_id: str) -> None:
+        self.query_one("#tabs", TabbedContent).active = tab_id
 
     def action_refresh(self) -> None:
         bg_fetch_cheap()
