@@ -28,4 +28,4 @@ Shell-out helpers `run_cmd()` and `systemctl_user()` wrap subprocess with timeou
 
 ## Keybindings
 
-`1-4` switch tab · `s/t/r/l` tunnel start/stop/restart/logs · `u/d/x` container start/stop/restart · `g` timer logs · `f` force refresh · `q` quit
+`1-5` switch tab · `s/t/r/l` tunnel start/stop/restart/logs · `u/d/x` container start/stop/restart · `g` timer logs · `R/E/L` app rebuild/edit-env/logs · `f` force refresh · `q` quit

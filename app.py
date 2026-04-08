@@ -1,6 +1,6 @@
 """
 ServerTUI — Local server dashboard for managing Cloudflare tunnels,
-Docker containers, and monitoring system resources.
+Docker containers, apps (local repos), and monitoring system resources.
 """
 
 import os
