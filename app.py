@@ -49,6 +49,7 @@ class App:
     name: str               # display name; container will be servertui-<name>
     repo_path: Path         # absolute path to a local git clone
     tunnel: str | None = None  # bare tunnel name, e.g. "foo" (NOT "cloudflared-foo.service")
+    compose_file: str | None = None  # override compose filename, relative to repo_path
 
 
 CONFIG_DIR = Path.home() / ".config" / "servertui"
@@ -84,10 +85,16 @@ def load_apps() -> list[App]:
             print(f"[servertui] {APPS_CONFIG}[{i}]: 'tunnel' must be a string, skipping",
                   file=sys.stderr)
             continue
+        compose_file = entry.get("compose_file")
+        if compose_file is not None and not isinstance(compose_file, str):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: 'compose_file' must be a string, skipping",
+                  file=sys.stderr)
+            continue
         out.append(App(
             name=name,
             repo_path=Path(repo_path).expanduser(),
             tunnel=tunnel,
+            compose_file=compose_file,
         ))
     return out
 
@@ -204,10 +211,13 @@ def inspect_env_file(path: Path) -> tuple[int | None, bool]:
         return (None, perms_ok)
 
 
-def detect_build_mode(repo_path: Path) -> str:
-    """Return 'compose', 'dockerfile', or 'none'."""
+def detect_build_mode(repo_path: Path, compose_file: str | None = None) -> str:
+    """Return 'compose', 'dockerfile', or 'none'.
+    If compose_file is set, only that file counts as compose mode."""
     if not repo_path.is_dir():
         return "none"
+    if compose_file:
+        return "compose" if (repo_path / compose_file).exists() else "none"
     if (repo_path / "compose.yml").exists() or (repo_path / "docker-compose.yml").exists():
         return "compose"
     if (repo_path / "Dockerfile").exists():
@@ -535,7 +545,7 @@ class DataStore:
                 git_state=git_state(app.repo_path),
                 env_key_count=env_count,
                 env_perms_ok=env_perms_ok,
-                build_mode=detect_build_mode(app.repo_path),
+                build_mode=detect_build_mode(app.repo_path, app.compose_file),
             ))
 
         self.set("apps", out)
@@ -570,9 +580,12 @@ def rebuild_app(app: "App"):
         yield "[exit 1]"
         return
 
-    mode = detect_build_mode(app.repo_path)
+    mode = detect_build_mode(app.repo_path, app.compose_file)
     if mode == "none":
-        yield "[red]no Dockerfile or compose.yml in repo[/]"
+        if app.compose_file:
+            yield f"[red]compose_file not found: {app.repo_path / app.compose_file}[/]"
+        else:
+            yield "[red]no Dockerfile or compose.yml in repo[/]"
         yield "[exit 1]"
         return
 
@@ -651,9 +664,12 @@ def rebuild_app(app: "App"):
         return
 
     # compose mode
-    compose_file = app.repo_path / "compose.yml"
-    if not compose_file.exists():
-        compose_file = app.repo_path / "docker-compose.yml"
+    if app.compose_file:
+        compose_file = app.repo_path / app.compose_file
+    else:
+        compose_file = app.repo_path / "compose.yml"
+        if not compose_file.exists():
+            compose_file = app.repo_path / "docker-compose.yml"
     if env_path.exists():
         yield (
             "[yellow]note: compose mode — ServerTUI's env file is NOT auto-wired.[/]\n"

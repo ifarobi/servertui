@@ -7,5 +7,11 @@
   {
     "name": "bar",
     "repo_path": "/srv/bar"
+  },
+  {
+    "name": "foo-staging",
+    "repo_path": "~/src/foo",
+    "tunnel": "foo-staging",
+    "compose_file": "docker-compose.staging.yml"
   }
 ]
