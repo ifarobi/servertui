@@ -39,22 +39,29 @@ from textual.widgets import (
 ## Add entries here only to override description/domain or pin ordering.
 TUNNELS: list[dict] = []
 
-## Apps are locally-cloned repos that ServerTUI can manually rebuild and whose
-## env files it manages. Each app owns exactly one container named
-## `servertui-<name>`. ServerTUI will never touch containers it didn't name.
+## Apps are git repos that ServerTUI clones into a managed directory and can
+## rebuild. Each app owns exactly one container named `servertui-<name>`.
+## ServerTUI will never touch containers it didn't name.
 ##
 ## Configured via ~/.config/servertui/apps.json (see apps.example.json in repo).
-@dataclass(frozen=True)
-class App:
-    name: str               # display name; container will be servertui-<name>
-    repo_path: Path         # absolute path to a local git clone
-    tunnel: str | None = None  # bare tunnel name, e.g. "foo" (NOT "cloudflared-foo.service")
-    compose_file: str | None = None  # override compose filename, relative to repo_path
-
 
 CONFIG_DIR = Path.home() / ".config" / "servertui"
 APPS_CONFIG = CONFIG_DIR / "apps.json"
 ENV_DIR = CONFIG_DIR / "env"
+APPS_DIR = Path(os.environ.get("SERVERTUI_APPS_DIR", str(Path.home() / "servertui" / "apps")))
+
+
+@dataclass(frozen=True)
+class App:
+    name: str               # display name; container will be servertui-<name>
+    git_url: str            # git remote URL (SSH or HTTPS)
+    tunnel: str | None = None  # bare tunnel name, e.g. "foo" (NOT "cloudflared-foo.service")
+    branch: str | None = None  # branch to clone/checkout; None = repo default
+    compose_file: str | None = None  # override compose filename, relative to repo root
+
+    @property
+    def repo_path(self) -> Path:
+        return APPS_DIR / self.name
 
 
 def load_apps() -> list[App]:
@@ -75,14 +82,19 @@ def load_apps() -> list[App]:
             print(f"[servertui] {APPS_CONFIG}[{i}]: not an object, skipping", file=sys.stderr)
             continue
         name = entry.get("name")
-        repo_path = entry.get("repo_path")
-        if not isinstance(name, str) or not isinstance(repo_path, str):
-            print(f"[servertui] {APPS_CONFIG}[{i}]: missing 'name' or 'repo_path', skipping",
+        git_url = entry.get("git_url")
+        if not isinstance(name, str) or not isinstance(git_url, str):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: missing 'name' or 'git_url', skipping",
                   file=sys.stderr)
             continue
         tunnel = entry.get("tunnel")
         if tunnel is not None and not isinstance(tunnel, str):
             print(f"[servertui] {APPS_CONFIG}[{i}]: 'tunnel' must be a string, skipping",
+                  file=sys.stderr)
+            continue
+        branch = entry.get("branch")
+        if branch is not None and not isinstance(branch, str):
+            print(f"[servertui] {APPS_CONFIG}[{i}]: 'branch' must be a string, skipping",
                   file=sys.stderr)
             continue
         compose_file = entry.get("compose_file")
@@ -92,14 +104,52 @@ def load_apps() -> list[App]:
             continue
         out.append(App(
             name=name,
-            repo_path=Path(repo_path).expanduser(),
+            git_url=git_url,
             tunnel=tunnel,
+            branch=branch,
             compose_file=compose_file,
         ))
     return out
 
 
 APPS: list[App] = load_apps()
+
+# Clone status tracking: app name → "cloning" | "done" | error message
+_clone_status: dict[str, str] = {}
+_clone_lock = Lock()
+
+
+def clone_if_missing(app: App) -> None:
+    """Clone app repo if not already present. Updates _clone_status."""
+    if app.repo_path.exists():
+        with _clone_lock:
+            _clone_status[app.name] = "done"
+        return
+    APPS_DIR.mkdir(parents=True, exist_ok=True)
+    with _clone_lock:
+        _clone_status[app.name] = "cloning"
+    cmd = ["git", "clone", app.git_url, str(app.repo_path)]
+    if app.branch:
+        cmd.extend(["--branch", app.branch])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        with _clone_lock:
+            if result.returncode == 0:
+                _clone_status[app.name] = "done"
+            else:
+                _clone_status[app.name] = result.stderr.strip() or "clone failed"
+    except subprocess.TimeoutExpired:
+        with _clone_lock:
+            _clone_status[app.name] = "clone timed out"
+    except OSError as e:
+        with _clone_lock:
+            _clone_status[app.name] = str(e)
+
+
+def get_clone_status(app_name: str) -> str:
+    """Return clone status for an app: 'cloning' | 'done' | error string."""
+    with _clone_lock:
+        return _clone_status.get(app_name, "done")
 
 
 @dataclass
@@ -110,7 +160,7 @@ class AppInfo:
     uptime: str | None
     tunnel: str | None
     tunnel_status: str | None      # "active" | "inactive" | None
-    git_state: str                 # "clean" | "dirty" | f"behind {n}" | "?"
+    git_state: str                 # "clean" | "dirty" | f"behind {n}" | "?" | "cloning" | "clone-failed"
     env_key_count: int | None      # None if file missing
     env_perms_ok: bool             # True if file missing OR mode == 0o600
     build_mode: str                # "dockerfile" | "compose" | "none"
@@ -535,6 +585,17 @@ class DataStore:
                 tunnel_status_by_service.get(tunnel_service) if tunnel_service else None
             )
 
+            cs = get_clone_status(app.name)
+            if cs == "cloning":
+                app_git_state = "cloning"
+                app_build_mode = "none"
+            elif cs != "done":
+                app_git_state = "clone-failed"
+                app_build_mode = "none"
+            else:
+                app_git_state = git_state(app.repo_path)
+                app_build_mode = detect_build_mode(app.repo_path, app.compose_file)
+
             out.append(AppInfo(
                 name=app.name,
                 container_status=status,
@@ -542,10 +603,10 @@ class DataStore:
                 uptime=uptime,
                 tunnel=app.tunnel,
                 tunnel_status=tunnel_status,
-                git_state=git_state(app.repo_path),
+                git_state=app_git_state,
                 env_key_count=env_count,
                 env_perms_ok=env_perms_ok,
-                build_mode=detect_build_mode(app.repo_path, app.compose_file),
+                build_mode=app_build_mode,
             ))
 
         self.set("apps", out)
@@ -575,8 +636,15 @@ def rebuild_app(app: "App"):
     container = f"servertui-{app.name}"
     env_path = ENV_DIR / f"{app.name}.env"
 
+    cs = get_clone_status(app.name)
+    if cs == "cloning":
+        yield "[yellow]repo is still cloning, please wait…[/]"
+        yield "[exit 1]"
+        return
     if not app.repo_path.is_dir():
-        yield f"[red]repo path does not exist: {app.repo_path}[/]"
+        yield f"[red]repo not cloned yet: {app.repo_path}[/]"
+        if cs != "done":
+            yield f"[red]clone error: {cs}[/]"
         yield "[exit 1]"
         return
 
@@ -968,7 +1036,13 @@ class AppPanel(Static):
                 lines.append(f"       📦 {a.image}")
 
             mode_str = a.build_mode if a.build_mode != "none" else "[red]no Dockerfile/compose[/]"
-            lines.append(f"       🔧 {mode_str}   📁 git: {a.git_state}")
+            if a.git_state == "cloning":
+                git_str = "[yellow]cloning…[/]"
+            elif a.git_state == "clone-failed":
+                git_str = "[red]clone failed[/]"
+            else:
+                git_str = a.git_state
+            lines.append(f"       🔧 {mode_str}   📁 git: {git_str}")
 
             if a.tunnel:
                 t_icon = "🟢" if a.tunnel_status == "active" else "🔴"
@@ -1271,6 +1345,10 @@ class ServerTUI(TextualApp):
     def on_mount(self) -> None:
         # Prime CPU counter
         psutil.cpu_percent(interval=None)
+        # Auto-clone any app repos that are missing
+        for app in APPS:
+            if not app.repo_path.exists():
+                Thread(target=clone_if_missing, args=(app,), daemon=True).start()
         # Initial cheap fetch (instant)
         bg_fetch_cheap()
         self._render_ui()

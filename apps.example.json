@@ -1,17 +1,18 @@
 [
   {
     "name": "foo",
-    "repo_path": "~/src/foo",
+    "git_url": "git@github.com:user/foo.git",
     "tunnel": "foo"
   },
   {
     "name": "bar",
-    "repo_path": "/srv/bar"
+    "git_url": "https://github.com/user/bar.git"
   },
   {
     "name": "foo-staging",
-    "repo_path": "~/src/foo",
+    "git_url": "git@github.com:user/foo.git",
     "tunnel": "foo-staging",
+    "branch": "staging",
     "compose_file": "docker-compose.staging.yml"
   }
 ]

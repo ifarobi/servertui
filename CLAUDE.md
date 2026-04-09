@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-ServerTUI is a single-file Textual TUI (`app.py`, ~770 lines) for managing local server infrastructure: Cloudflare tunnels (via `systemctl --user`), Docker containers, Ollama models, and system stats.
+ServerTUI is a single-file Textual TUI (`app.py`, ~850 lines) for managing local server infrastructure: Cloudflare tunnels (via `systemctl --user`), Docker containers, git-managed app deployments, Ollama models, and system stats.
 
 ## Run
 
@@ -24,7 +24,7 @@ Everything lives in `app.py`. Key pieces:
 - **Modal screens**: `SelectorScreen` (pick a tunnel/container for an action) and `LogScreen` (journalctl viewer for tunnels).
 - **`ServerTUI`** (line 509): app entrypoint, key bindings, action dispatch.
 
-Shell-out helpers `run_cmd()` and `systemctl_user()` wrap subprocess with timeouts. Tunnels are configured by editing the `TUNNELS` list near the top of `app.py` — each entry maps to a `cloudflared-<name>.service` user unit.
+Shell-out helpers `run_cmd()` and `systemctl_user()` wrap subprocess with timeouts. Tunnels are auto-discovered from `cloudflared-*.service` user units. Apps are configured via `~/.config/servertui/apps.json` with `git_url` fields — repos are auto-cloned into `~/servertui/apps/<name>/` (override via `SERVERTUI_APPS_DIR` env var).
 
 ## Keybindings
 
