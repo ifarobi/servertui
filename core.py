@@ -8,7 +8,6 @@ rebuild logic.
 
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -240,13 +239,14 @@ def git_state(repo_path: Path) -> str:
 
 # ─── Docker operations ───────────────────────────────────────────────
 
-def docker_container_list() -> list[dict]:
-    """Cheap: return name, status, image for all containers (no stats)."""
+def docker_container_list() -> list[dict] | None:
+    """Cheap: return name, status, image for all containers (no stats).
+    Returns None when Docker is unreachable."""
     try:
         client = docker.from_env()
         client.ping()
     except Exception:
-        return []
+        return None
 
     containers = []
     for c in client.containers.list(all=True):
@@ -259,13 +259,14 @@ def docker_container_list() -> list[dict]:
     return containers
 
 
-def docker_container_stats() -> list[dict]:
-    """Expensive: return name, status, image, cpu_pct, mem_usage, mem_limit for all containers."""
+def docker_container_stats() -> list[dict] | None:
+    """Expensive: return name, status, image, cpu_pct, mem_usage, mem_limit for all containers.
+    Returns None when Docker is unreachable."""
     try:
         client = docker.from_env()
         client.ping()
     except Exception:
-        return []
+        return None
 
     containers = []
     for c in client.containers.list(all=True):

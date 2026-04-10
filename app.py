@@ -22,18 +22,12 @@ from textual.app import App as TextualApp, ComposeResult
 from core import (
     App as AppConfig,
     AppInfo,
-    APPS_CONFIG,
-    APPS_DIR,
-    CONFIG_DIR,
     ENV_DIR,
     clone_if_missing,
-    detect_build_mode,
+    docker_action,
     docker_container_stats,
     fetch_app_status,
     fmt_bytes,
-    get_clone_status,
-    git_state,
-    inspect_env_file,
     load_apps,
     rebuild_app,
     run_cmd,
@@ -276,18 +270,8 @@ class DataStore:
 
     def fetch_docker(self):
         """Fetch docker container list + stats (EXPENSIVE — runs in bg)."""
-        containers = docker_container_stats()
-        if not containers:
-            # Distinguish "no containers" from "docker not reachable"
-            try:
-                import docker as _docker
-                client = _docker.from_env()
-                client.ping()
-                self.set("docker", [])
-            except Exception:
-                self.set("docker", None)
-            return
-        self.set("docker", containers)
+        result = docker_container_stats()
+        self.set("docker", result)
 
     def fetch_ollama(self):
         """Fetch ollama status (cheap, HTTP calls)."""
@@ -1037,13 +1021,11 @@ class ServerTUI(TextualApp):
     def _docker_action(self, action: str, name: str | None) -> None:
         if name is None:
             return
-        try:
-            client = docker.from_env()
-            container = client.containers.get(name)
-            getattr(container, action)()
-            self.notify(f"{action.capitalize()}ed {name}")
-        except Exception as e:
-            self.notify(f"Error: {e}", severity="error")
+        result = docker_action(name, action)
+        if result.startswith("Error"):
+            self.notify(result, severity="error")
+        else:
+            self.notify(result)
         self._start_bg_fetch()
 
     def action_docker_start(self) -> None:
