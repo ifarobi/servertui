@@ -154,6 +154,62 @@ Tunnels are auto-discovered from `cloudflared-*.service` systemd user units — 
 
 Docker stats are fetched in a daemon thread to avoid blocking the UI (~1-2s per container).
 
+## MCP Server (AI Agent Integration)
+
+ServerTUI includes an MCP server that lets AI agents (like Claude Code) query
+status, read logs, manage Docker containers, and trigger app rebuilds.
+
+### Setup
+
+1. Install the MCP dependency:
+
+   ```bash
+   source .venv/bin/activate
+   pip install mcp
+   ```
+
+2. Add to your Claude Code MCP config (`~/.claude/settings.json` or project `.claude/settings.json`):
+
+   ```json
+   {
+     "mcpServers": {
+       "servertui": {
+         "command": "/path/to/servertui/.venv/bin/python",
+         "args": ["mcp_server.py"],
+         "cwd": "/path/to/servertui"
+       }
+     }
+   }
+   ```
+
+3. Restart Claude Code. The tools will be available automatically.
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_docker_containers` | List containers with status, CPU%, RAM |
+| `get_app_status` | List apps with container/git/build/env status |
+| `get_app_logs` | Tail docker logs for an app |
+| `get_container_logs` | Tail docker logs for any container |
+| `rebuild_app` | Trigger git pull + build (async, returns job ID) |
+| `get_rebuild_status` | Check rebuild progress/completion |
+| `docker_start` | Start a stopped container |
+| `docker_stop` | Stop a running container |
+| `docker_restart` | Restart a container |
+
+### Example Conversation
+
+> **You:** "Is coloring-cafe running?"
+> Claude Code calls `get_app_status(name="coloring-cafe")` and reports the result.
+
+> **You:** "Redeploy it"
+> Claude Code calls `rebuild_app(name="coloring-cafe")`, gets a job ID,
+> then polls `get_rebuild_status` until it completes.
+
+> **You:** "Show me the last 50 lines of logs"
+> Claude Code calls `get_app_logs(name="coloring-cafe", lines=50)`.
+
 ## License
 
 MIT
