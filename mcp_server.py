@@ -5,7 +5,6 @@ for AI agent integration (e.g., Claude Code).
 
 import json
 import re
-import shlex
 import subprocess
 from dataclasses import dataclass
 from threading import Lock, Thread
@@ -15,12 +14,10 @@ from mcp.server.fastmcp import FastMCP
 
 from core import (
     App,
-    AppInfo,
     docker_action,
     docker_container_list,
     docker_container_stats,
     fetch_app_status,
-    fmt_bytes,
     load_apps,
     rebuild_app as core_rebuild_app,
 )
@@ -41,12 +38,18 @@ _jobs: dict[str, RebuildJob] = {}
 _jobs_lock = Lock()
 
 
+def _strip_rich_markup(text: str) -> str:
+    """Remove Rich markup tags like [red], [/red], [bold], [dim], etc."""
+    return re.sub(r"\[/?[a-z_ ]+\]", "", text)
+
+
 def _run_rebuild(job: RebuildJob, app: App) -> None:
     """Background thread: consume rebuild_app generator and update job state."""
     try:
         for line in core_rebuild_app(app):
+            clean = _strip_rich_markup(line)
             with _jobs_lock:
-                job.output_lines.append(line)
+                job.output_lines.append(clean)
     finally:
         with _jobs_lock:
             # Parse exit code from final line like "[exit 0]" or "[exit 1]"
@@ -179,16 +182,14 @@ def rebuild_app(name: str) -> str:
                     "error": f"Rebuild already in progress for {name}",
                     "job_id": j.job_id,
                 })
-
-    job_id = uuid4().hex[:8]
-    job = RebuildJob(
-        job_id=job_id,
-        app_name=name,
-        status="running",
-        output_lines=[],
-        exit_code=None,
-    )
-    with _jobs_lock:
+        job_id = uuid4().hex[:8]
+        job = RebuildJob(
+            job_id=job_id,
+            app_name=name,
+            status="running",
+            output_lines=[],
+            exit_code=None,
+        )
         _jobs[job_id] = job
 
     Thread(target=_run_rebuild, args=(job, app), daemon=True).start()
@@ -204,9 +205,8 @@ def get_rebuild_status(job_id: str) -> str:
     """
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if job is None:
-        return json.dumps({"error": f"Job not found: {job_id}"})
-    with _jobs_lock:
+        if job is None:
+            return json.dumps({"error": f"Job not found: {job_id}"})
         return json.dumps({
             "job_id": job.job_id,
             "app_name": job.app_name,
