@@ -68,5 +68,35 @@ def get_container_logs(name: str, lines: int = 100) -> str:
         return f"Error: {e}"
 
 
+@mcp.tool()
+def get_app_status(name: str | None = None) -> str:
+    """List configured apps with container status, git state, build mode, env info, and tunnel status.
+
+    Args:
+        name: Optional app name to filter to a single app.
+    """
+    apps = load_apps()
+    if not apps:
+        return json.dumps({"error": "No apps configured in ~/.config/servertui/apps.json"})
+    if name:
+        apps = [a for a in apps if a.name == name]
+        if not apps:
+            return json.dumps({"error": f"App not found: {name}"})
+    statuses = fetch_app_status(apps)
+    return json.dumps([s.to_dict() for s in statuses], indent=2)
+
+
+@mcp.tool()
+def get_app_logs(name: str, lines: int = 100) -> str:
+    """Get recent Docker logs for an app's container (servertui-<name>).
+
+    Args:
+        name: App name (container will be servertui-<name>).
+        lines: Number of tail lines to return (default 100).
+    """
+    container = f"servertui-{name}"
+    return get_container_logs(container, lines)
+
+
 if __name__ == "__main__":
     mcp.run()
