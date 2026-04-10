@@ -28,6 +28,38 @@ from core import (
 mcp = FastMCP("servertui")
 
 
+@dataclass
+class RebuildJob:
+    job_id: str
+    app_name: str
+    status: str             # "running" | "done" | "failed"
+    output_lines: list[str]
+    exit_code: int | None
+
+
+_jobs: dict[str, RebuildJob] = {}
+_jobs_lock = Lock()
+
+
+def _run_rebuild(job: RebuildJob, app: App) -> None:
+    """Background thread: consume rebuild_app generator and update job state."""
+    try:
+        for line in core_rebuild_app(app):
+            with _jobs_lock:
+                job.output_lines.append(line)
+    finally:
+        with _jobs_lock:
+            # Parse exit code from final line like "[exit 0]" or "[exit 1]"
+            exit_code = 1
+            for line in reversed(job.output_lines):
+                m = re.match(r"\[exit (\d+)\]", line)
+                if m:
+                    exit_code = int(m.group(1))
+                    break
+            job.exit_code = exit_code
+            job.status = "done" if exit_code == 0 else "failed"
+
+
 @mcp.tool()
 def get_docker_containers(brief: bool = False) -> str:
     """List all Docker containers with status and image. Set brief=False (default) to include CPU% and RAM stats (slow, ~1-2s per container).
@@ -126,6 +158,62 @@ def docker_restart(name: str) -> str:
         name: Container name.
     """
     return docker_action(name, "restart")
+
+
+@mcp.tool()
+def rebuild_app(name: str) -> str:
+    """Trigger a full app rebuild: git pull + docker build + restart. Runs in background, returns a job ID. Poll get_rebuild_status to check progress.
+
+    Args:
+        name: App name to rebuild.
+    """
+    apps = load_apps()
+    app = next((a for a in apps if a.name == name), None)
+    if app is None:
+        return json.dumps({"error": f"App not found: {name}"})
+
+    with _jobs_lock:
+        for j in _jobs.values():
+            if j.app_name == name and j.status == "running":
+                return json.dumps({
+                    "error": f"Rebuild already in progress for {name}",
+                    "job_id": j.job_id,
+                })
+
+    job_id = uuid4().hex[:8]
+    job = RebuildJob(
+        job_id=job_id,
+        app_name=name,
+        status="running",
+        output_lines=[],
+        exit_code=None,
+    )
+    with _jobs_lock:
+        _jobs[job_id] = job
+
+    Thread(target=_run_rebuild, args=(job, app), daemon=True).start()
+    return json.dumps({"job_id": job_id, "status": "started"})
+
+
+@mcp.tool()
+def get_rebuild_status(job_id: str) -> str:
+    """Check the progress of a running or completed rebuild job.
+
+    Args:
+        job_id: Job ID returned by rebuild_app.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return json.dumps({"error": f"Job not found: {job_id}"})
+    with _jobs_lock:
+        return json.dumps({
+            "job_id": job.job_id,
+            "app_name": job.app_name,
+            "status": job.status,
+            "output_lines": list(job.output_lines),
+            "exit_code": job.exit_code,
+        }, indent=2)
 
 
 if __name__ == "__main__":
