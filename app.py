@@ -709,9 +709,21 @@ def rebuild_app(app: "App"):
             yield f"[exit {rc}]"
             return
 
-        yield "[dim]$ docker rm -f {}[/]".format(container)
+        yield "[dim]$ docker stop {} && docker rm -f {}[/]".format(container, container)
+        subprocess.run(["docker", "stop", container],
+                       capture_output=True, text=True, timeout=30)
         subprocess.run(["docker", "rm", "-f", container],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=30)
+        # Verify the container is actually gone before trying to create it
+        check = subprocess.run(
+            ["docker", "container", "inspect", container],
+            capture_output=True, text=True,
+        )
+        if check.returncode == 0:
+            yield f"[red]failed to remove existing container {container}[/]"
+            yield "[red]try manually: docker rm -f {}[/]".format(container)
+            yield "[exit 1]"
+            return
 
         run_cmd_list = [
             "docker", "run", "-d",
