@@ -342,7 +342,7 @@ class DataStore:
             "system": {},
             "tunnels": [],
             "timers": [],
-            "docker": [],
+            "docker": "loading",
             "ollama": {},
             "apps": [],
         }
@@ -883,7 +883,9 @@ class DockerPanel(Static):
         containers = STORE.get("docker")
         lines = ["[bold cyan]═══ 🐳 Docker Containers ═══[/]\n"]
 
-        if containers is None:
+        if containers == "loading":
+            lines.append("  [dim]⏳ Loading Docker containers…[/]")
+        elif containers is None:
             lines.append("  ⚠️  [red]Docker daemon not reachable[/]")
         elif not containers:
             lines.append("  [dim]📭 No containers found[/]")
