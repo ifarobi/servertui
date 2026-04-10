@@ -98,5 +98,35 @@ def get_app_logs(name: str, lines: int = 100) -> str:
     return get_container_logs(container, lines)
 
 
+@mcp.tool()
+def docker_start(name: str) -> str:
+    """Start a stopped Docker container.
+
+    Args:
+        name: Container name.
+    """
+    return docker_action(name, "start")
+
+
+@mcp.tool()
+def docker_stop(name: str) -> str:
+    """Stop a running Docker container.
+
+    Args:
+        name: Container name.
+    """
+    return docker_action(name, "stop")
+
+
+@mcp.tool()
+def docker_restart(name: str) -> str:
+    """Restart a Docker container.
+
+    Args:
+        name: Container name.
+    """
+    return docker_action(name, "restart")
+
+
 if __name__ == "__main__":
     mcp.run()
