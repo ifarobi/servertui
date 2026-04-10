@@ -1,0 +1,72 @@
+"""
+ServerTUI MCP Server — exposes app and Docker operations as MCP tools
+for AI agent integration (e.g., Claude Code).
+"""
+
+import json
+import re
+import shlex
+import subprocess
+from dataclasses import dataclass
+from threading import Lock, Thread
+from uuid import uuid4
+
+from mcp.server.fastmcp import FastMCP
+
+from core import (
+    App,
+    AppInfo,
+    docker_action,
+    docker_container_list,
+    docker_container_stats,
+    fetch_app_status,
+    fmt_bytes,
+    load_apps,
+    rebuild_app as core_rebuild_app,
+)
+
+mcp = FastMCP("servertui")
+
+
+@mcp.tool()
+def get_docker_containers(brief: bool = False) -> str:
+    """List all Docker containers with status and image. Set brief=False (default) to include CPU% and RAM stats (slow, ~1-2s per container).
+
+    Args:
+        brief: If True, skip expensive CPU/RAM stats and return only name, status, image.
+    """
+    if brief:
+        containers = docker_container_list()
+    else:
+        containers = docker_container_stats()
+    if containers is None:
+        return json.dumps({"error": "Docker daemon not reachable"})
+    if not containers:
+        return json.dumps({"info": "No containers found"})
+    return json.dumps(containers, indent=2)
+
+
+@mcp.tool()
+def get_container_logs(name: str, lines: int = 100) -> str:
+    """Get recent Docker logs for any container by name.
+
+    Args:
+        name: Container name.
+        lines: Number of tail lines to return (default 100).
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--tail", str(lines), name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return f"Error: {result.stderr.strip()}"
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        return "Error: timed out reading logs"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+if __name__ == "__main__":
+    mcp.run()
