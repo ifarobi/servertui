@@ -268,6 +268,109 @@ def parse_env_file(path: Path) -> list[tuple[str, str]]:
     return [(k, pairs[k]) for k in order]
 
 
+def _quote_env_value(value: str) -> str:
+    """Emit a .env-compatible serialization of value."""
+    if value == "":
+        return ""
+    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+               "0123456789_./:@+-")
+    if all(ch in safe for ch in value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def merge_env_keys(
+    canonical_path: Path,
+    updates: list[tuple[str, str]],
+    source_label: str,
+) -> int:
+    """Write updates into canonical_path, preserving comments and unrelated keys.
+
+    - Creates the file atomically (0600, O_EXCL) if missing, seeded with a
+      minimal header.
+    - Replaces existing KEY=... lines in place for keys present in canonical.
+    - Appends new keys under a dated `# imported …` marker.
+    - If a key appears multiple times in canonical, replaces the last
+      occurrence and deletes earlier ones (opportunistic dedup).
+    - Atomic write via <path>.tmp + os.replace.
+
+    Returns len(updates) on success. Raises OSError on filesystem errors.
+    """
+    import datetime
+    if not updates:
+        return 0
+
+    if not canonical_path.exists():
+        header = (
+            f"# ServerTUI env file for '{canonical_path.stem}'\n"
+            f"# Location: {canonical_path} (0600, injected via docker --env-file).\n"
+            f"# Stored outside the git repo so secrets stay uncommitted.\n"
+        ).encode()
+        fd = os.open(canonical_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, header)
+        finally:
+            os.close(fd)
+
+    text = canonical_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+
+    key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    key_lines: dict[str, list[int]] = {}
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        body = stripped
+        if body.startswith("export "):
+            body = body[len("export "):].lstrip()
+        if "=" not in body:
+            continue
+        key = body.split("=", 1)[0].strip()
+        if key_re.match(key):
+            key_lines.setdefault(key, []).append(idx)
+
+    in_place: list[tuple[str, str]] = []
+    appended: list[tuple[str, str]] = []
+    for key, value in updates:
+        if key in key_lines:
+            in_place.append((key, value))
+        else:
+            appended.append((key, value))
+
+    to_delete: set[int] = set()
+    for key, value in in_place:
+        indices = key_lines[key]
+        last = indices[-1]
+        lines[last] = f"{key}={_quote_env_value(value)}\n"
+        for earlier in indices[:-1]:
+            to_delete.add(earlier)
+    if to_delete:
+        lines = [line for i, line in enumerate(lines) if i not in to_delete]
+
+    if appended:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        today = datetime.date.today().isoformat()
+        lines.append("\n")
+        lines.append(f"# imported {today} from {source_label}\n")
+        for key, value in appended:
+            lines.append(f"{key}={_quote_env_value(value)}\n")
+
+    tmp_path = canonical_path.with_suffix(canonical_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, "".join(lines).encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, canonical_path)
+    return len(updates)
+
+
 def detect_build_mode(repo_path: Path, compose_file: str | None = None) -> str:
     """Return 'compose', 'dockerfile', or 'none'.
     If compose_file is set, only that file counts as compose mode."""
