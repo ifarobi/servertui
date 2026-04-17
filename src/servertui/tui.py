@@ -40,6 +40,7 @@ from textual.widgets import (
     Footer,
     Header,
     RichLog,
+    SelectionList,
     Static,
     TabbedContent,
     TabPane,
@@ -735,6 +736,50 @@ class SelectorScreen(ModalScreen[str | None]):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.dismiss(str(event.row_key.value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ImportKeysScreen(ModalScreen[list[tuple[str, str]] | None]):
+    """Per-key selection modal for env import. Returns selected pairs or None."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Import"),
+    ]
+
+    def __init__(
+        self,
+        source_name: str,
+        pairs: list[tuple[str, str]],
+        canonical_keys: set[str],
+    ) -> None:
+        super().__init__()
+        self.source_name = source_name
+        self.pairs = pairs
+        self.canonical_keys = canonical_keys
+
+    def compose(self) -> ComposeResult:
+        with Container(id="selector-box"):
+            yield Static(
+                f"[bold]Import from {self.source_name}[/]\n"
+                f"[dim]Space to toggle, Enter to import, Esc to cancel[/]\n",
+                id="selector-title",
+            )
+            options = []
+            for i, (key, value) in enumerate(self.pairs):
+                preview = value if len(value) <= 40 else value[:37] + "…"
+                tag = "[yellow]replaces[/]" if key in self.canonical_keys else "[green]new[/]"
+                label = f"{key}={preview}  {tag}"
+                options.append((label, i, True))  # all selected by default
+            yield SelectionList[int](*options, id="import-list")
+
+    def action_submit(self) -> None:
+        sl = self.query_one("#import-list", SelectionList)
+        indices = sorted(sl.selected)
+        result = [self.pairs[i] for i in indices]
+        self.dismiss(result)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
