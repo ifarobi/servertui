@@ -8,6 +8,7 @@ rebuild logic.
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -190,6 +191,81 @@ def inspect_env_file(path: Path) -> tuple[int | None, bool]:
         return (count, perms_ok)
     except OSError:
         return (None, perms_ok)
+
+
+def parse_env_file(path: Path) -> list[tuple[str, str]]:
+    """Parse a .env-style file into an ordered list of (key, value) pairs.
+
+    Handles KEY=value, `export KEY=value`, quoted values ("..." or '...'),
+    inline # comments in unquoted values, and blank/comment lines.
+    Malformed lines are logged to stderr and skipped; parsing never raises.
+    Duplicate keys: last wins (matches Docker --env-file behavior).
+    """
+    key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    pairs: dict[str, str] = {}
+    order: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"[servertui] cannot read {path}: {e}", file=sys.stderr)
+        return []
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            print(f"[servertui] {path}:{lineno}: no '=' in line, skipping",
+                  file=sys.stderr)
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not key_re.match(key):
+            print(f"[servertui] {path}:{lineno}: invalid key {key!r}, skipping",
+                  file=sys.stderr)
+            continue
+        value = rest.lstrip()
+        if value.startswith('"') or value.startswith("'"):
+            quote = value[0]
+            end = -1
+            i = 1
+            while i < len(value):
+                ch = value[i]
+                if quote == '"' and ch == "\\" and i + 1 < len(value):
+                    i += 2
+                    continue
+                if ch == quote:
+                    end = i
+                    break
+                i += 1
+            if end == -1:
+                print(f"[servertui] {path}:{lineno}: unterminated quote, skipping",
+                      file=sys.stderr)
+                continue
+            inner = value[1:end]
+            if quote == '"':
+                inner = (inner.replace(r"\n", "\n")
+                              .replace(r"\t", "\t")
+                              .replace(r'\"', '"')
+                              .replace(r"\\", "\\"))
+            value = inner
+        else:
+            hash_idx = -1
+            for i, ch in enumerate(value):
+                if ch == "#" and (i == 0 or value[i - 1].isspace()):
+                    hash_idx = i
+                    break
+            if hash_idx != -1:
+                value = value[:hash_idx]
+            value = value.rstrip()
+        if key in pairs:
+            pairs[key] = value
+        else:
+            pairs[key] = value
+            order.append(key)
+    return [(k, pairs[k]) for k in order]
 
 
 def detect_build_mode(repo_path: Path, compose_file: str | None = None) -> str:
