@@ -324,9 +324,11 @@ jobs:
 
 ## Documentation Updates
 
-- **README.md** — rewrite the "Installation" section to lead with the curl one-liner, followed by `uv tool install servertui` and `pipx install servertui`. Remove the manual `git clone` + `venv` + `pip install` instructions from the install path (keep them in a "Development" section). Update MCP config snippet to `"command": "servertui", "args": ["mcp"]`.
-- **CLAUDE.md** — update the "Run" section to mention `servertui` (installed) as the primary path, `./run.sh` as the dev path.
-- **AGENTS.md** — no changes needed; tool surface is unchanged.
+- **README.md** — rewrite the "Installation" section to lead with the curl one-liner, followed by `uv tool install servertui` and `pipx install servertui`. Remove the manual `git clone` + `venv` + `pip install` instructions from the install path (keep them in a "Development" section). Update the MCP config snippet to `"command": "servertui", "args": ["mcp"]`. Update the `apps.example.json` reference — the file has moved into the package; link to it on GitHub (`src/servertui/apps.example.json`) or instruct users to run `servertui init`.
+- **CLAUDE.md** — two sections change:
+  - **Run** — swap the `./run.sh` note for `servertui` (installed) as the primary path and `./run.sh` / `uv run servertui` for the dev path.
+  - **Architecture** — update all file paths from flat layout to `src/servertui/`: `core.py` → `src/servertui/core.py`, `app.py` → `src/servertui/tui.py` (note the rename), `mcp_server.py` → `src/servertui/mcp.py`. The line-number references (`DataStore` line 119, `ServerTUI` line 509) should be re-verified against the moved file and updated if the import rewrite shifted them.
+- **AGENTS.md** — update the intro line that references `mcp_server.py` to point at `src/servertui/mcp.py` (or drop the path — the tool surface is what matters, not the filename). Tool behavior is unchanged.
 
 ## Risks / Open Questions
 
