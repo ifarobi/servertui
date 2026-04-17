@@ -45,6 +45,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from rich.markup import escape as _rich_escape
 
 # ─── Config ──────────────────────────────────────────────────────────
 
@@ -746,7 +747,7 @@ class ImportKeysScreen(ModalScreen[list[tuple[str, str]] | None]):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("enter", "submit", "Import"),
+        Binding("enter", "submit", "Import", priority=True),
     ]
 
     def __init__(
@@ -771,7 +772,7 @@ class ImportKeysScreen(ModalScreen[list[tuple[str, str]] | None]):
             for i, (key, value) in enumerate(self.pairs):
                 preview = value if len(value) <= 40 else value[:37] + "…"
                 tag = "[yellow]replaces[/]" if key in self.canonical_keys else "[green]new[/]"
-                label = f"{key}={preview}  {tag}"
+                label = f"{_rich_escape(key)}={_rich_escape(preview)}  {tag}"
                 options.append((label, i, True))  # all selected by default
             yield SelectionList[int](*options, id="import-list")
 
@@ -948,7 +949,7 @@ class ServerTUI(TextualApp):
 
     #log-view { height: 1fr; }
 
-    SelectorScreen, LogScreen, BuildScreen { align: center middle; }
+    SelectorScreen, ImportKeysScreen, LogScreen, BuildScreen { align: center middle; }
     """
 
     BINDINGS = [
