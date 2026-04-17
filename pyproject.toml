@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "textual>=0.60",
+    "textual>=1.0",
     "psutil>=5.9",
     "docker>=7.0",
     "mcp>=1.0",

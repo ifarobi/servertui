@@ -576,7 +576,7 @@ class AppPanel(Static):
         lines = ["[bold cyan]═══ 📦 Apps ═══[/]\n"]
 
         if not APPS:
-            lines.append("  [dim]No apps configured. Add entries to APPS in app.py.[/]")
+            lines.append("  [dim]No apps configured. Run `servertui init`, then edit ~/.config/servertui/apps.json.[/]")
             self.query_one("#apps-content", Static).update("\n".join(lines))
             return
 

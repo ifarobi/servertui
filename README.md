@@ -106,7 +106,7 @@ Apps are configured in `~/.config/servertui/apps.json`. ServerTUI auto-clones re
 | `branch` | no | Branch to clone/checkout. Defaults to repo's default branch |
 | `compose_file` | no | Override compose filename (default: `compose.yml` or `docker-compose.yml`) |
 
-An example config is bundled with the package — run `servertui init` to copy it into place, or view it on [GitHub](src/servertui/apps.example.json).
+An example config is bundled with the package — run `servertui init` to copy it into place, or view it on [GitHub](https://github.com/ifarobi/servertui/blob/main/src/servertui/apps.example.json).
 
 ### Clone directory
 

@@ -1,7 +1,7 @@
 """
 core.py — Shared logic for ServerTUI.
 
-Extracted from app.py so both the TUI and MCP server can import
+Extracted from tui.py so both the TUI and MCP server can import
 config, data types, helpers, docker operations, app status, and
 rebuild logic.
 """
