@@ -216,5 +216,7 @@ def get_rebuild_status(job_id: str) -> str:
         }, indent=2)
 
 
+# Canonical entry point is `servertui mcp`; this guard only fires for
+# `python -m servertui.mcp`.
 if __name__ == "__main__":
     mcp.run()
