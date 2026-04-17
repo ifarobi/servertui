@@ -4,7 +4,7 @@ Instructions for AI agents working with this repository.
 
 ## MCP Server
 
-ServerTUI provides an MCP server (`mcp_server.py`) for managing apps and Docker containers programmatically. If the MCP server is configured, prefer using these tools over shell commands for server operations.
+ServerTUI provides an MCP server (`servertui mcp`, implemented in `src/servertui/mcp.py`) for managing apps and Docker containers programmatically. If the MCP server is configured, prefer using these tools over shell commands for server operations.
 
 ### Available Tools
 
