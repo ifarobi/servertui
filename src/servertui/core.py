@@ -246,11 +246,19 @@ def parse_env_file(path: Path) -> list[tuple[str, str]]:
                 continue
             inner = value[1:end]
             if quote == '"':
-                inner = (inner.replace(r"\n", "\n")
-                              .replace(r"\r", "\r")
-                              .replace(r"\t", "\t")
-                              .replace(r'\"', '"')
-                              .replace(r"\\", "\\"))
+                out = []
+                i2 = 0
+                esc_map = {"n": "\n", "r": "\r", "t": "\t",
+                           '"': '"', "\\": "\\"}
+                while i2 < len(inner):
+                    if inner[i2] == "\\" and i2 + 1 < len(inner):
+                        nxt = inner[i2 + 1]
+                        out.append(esc_map.get(nxt, "\\" + nxt))
+                        i2 += 2
+                    else:
+                        out.append(inner[i2])
+                        i2 += 1
+                inner = "".join(out)
             value = inner
         else:
             hash_idx = -1
