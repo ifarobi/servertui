@@ -957,25 +957,42 @@ class ServerTUI(TextualApp):
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("s", "tunnel_start", "Start tunnel"),
-        Binding("t", "tunnel_stop", "Stop tunnel"),
-        Binding("r", "tunnel_restart", "Restart tunnel"),
-        Binding("l", "tunnel_logs", "Tunnel logs"),
-        Binding("u", "docker_start", "Start container"),
-        Binding("d", "docker_stop", "Stop container"),
-        Binding("x", "docker_restart", "Restart container"),
-        Binding("g", "timer_logs", "Timer logs"),
         Binding("1", "show_tab('tab-tunnels')", "Tunnels"),
         Binding("2", "show_tab('tab-docker')", "Docker"),
         Binding("3", "show_tab('tab-ollama')", "Ollama"),
         Binding("4", "show_tab('tab-timers')", "Timers"),
         Binding("5", "show_tab('tab-apps')", "Apps"),
-        Binding("L", "app_logs", "App logs"),
-        Binding("R", "app_rebuild", "Rebuild app"),
+        Binding("f", "refresh", "Refresh"),
+        Binding("s", "tunnel_start", "Start"),
+        Binding("t", "tunnel_stop", "Stop"),
+        Binding("r", "tunnel_restart", "Restart"),
+        Binding("l", "tunnel_logs", "Logs"),
+        Binding("u", "docker_start", "Start"),
+        Binding("d", "docker_stop", "Stop"),
+        Binding("x", "docker_restart", "Restart"),
+        Binding("g", "timer_logs", "Logs"),
+        Binding("L", "app_logs", "Logs"),
+        Binding("R", "app_rebuild", "Rebuild"),
         Binding("E", "app_edit_env", "Edit env"),
         Binding("I", "app_import_env", "Import env"),
-        Binding("f", "refresh", "Refresh"),
     ]
+
+    # Map each tab id to the action names whose bindings should appear
+    # in the footer only while that tab is active. Everything not listed
+    # here (q, 1-5, f) is always shown.
+    _TAB_ACTIONS: dict[str, frozenset[str]] = {
+        "tab-tunnels": frozenset(
+            {"tunnel_start", "tunnel_stop", "tunnel_restart", "tunnel_logs"}
+        ),
+        "tab-docker": frozenset(
+            {"docker_start", "docker_stop", "docker_restart"}
+        ),
+        "tab-timers": frozenset({"timer_logs"}),
+        "tab-apps": frozenset(
+            {"app_logs", "app_rebuild", "app_edit_env", "app_import_env"}
+        ),
+    }
+    _TAB_SCOPED_ACTIONS: frozenset[str] = frozenset().union(*_TAB_ACTIONS.values())
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1040,6 +1057,21 @@ class ServerTUI(TextualApp):
 
     def on_resize(self) -> None:
         self._check_layout()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide tab-specific bindings from the footer when their tab is inactive."""
+        if action not in self._TAB_SCOPED_ACTIONS:
+            return True
+        try:
+            active = self.query_one(TabbedContent).active
+        except Exception:
+            return True
+        return True if action in self._TAB_ACTIONS.get(active, frozenset()) else None
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        self.refresh_bindings()
 
     def _check_layout(self) -> None:
         if self.size.width < 90:
