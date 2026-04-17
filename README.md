@@ -47,26 +47,34 @@ Built with [Textual](https://github.com/Textualize/textual) for a smooth, respon
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ifarobi/servertui/main/install.sh | sh
+```
+
+This installs [uv](https://docs.astral.sh/uv/) if missing, then runs `uv tool install --upgrade servertui`. Safe to re-run — upgrades in place.
+
+### With an existing Python tool manager
+
+```bash
+uv tool install servertui      # or: pipx install servertui
+```
+
+### First-time setup
+
+```bash
+servertui init                 # scaffolds ~/.config/servertui/
+$EDITOR ~/.config/servertui/apps.json
+servertui                      # launches the TUI
+```
+
+## Development
+
 ```bash
 git clone git@github.com:ifarobi/servertui.git
 cd servertui
-python3 -m venv .venv
-source .venv/bin/activate
-pip install textual psutil docker
-```
-
-### Quick access (optional)
-
-```bash
-ln -sf "$(pwd)/run.sh" ~/.local/bin/servertui
-```
-
-Then just run `servertui` from anywhere.
-
-## Usage
-
-```bash
-./run.sh
+./run.sh                       # uses `uv run servertui` from the repo
 ```
 
 ## App Configuration
@@ -98,14 +106,14 @@ Apps are configured in `~/.config/servertui/apps.json`. ServerTUI auto-clones re
 | `branch` | no | Branch to clone/checkout. Defaults to repo's default branch |
 | `compose_file` | no | Override compose filename (default: `compose.yml` or `docker-compose.yml`) |
 
-An example config is included in the repo as `apps.example.json`.
+An example config is bundled with the package — run `servertui init` to copy it into place, or view it on [GitHub](src/servertui/apps.example.json).
 
 ### Clone directory
 
 Repos are cloned to `~/servertui/apps/<name>/`. Override with the `SERVERTUI_APPS_DIR` environment variable:
 
 ```bash
-SERVERTUI_APPS_DIR=/opt/servertui/apps ./run.sh
+SERVERTUI_APPS_DIR=/opt/servertui/apps servertui
 ```
 
 ### Env files
@@ -161,28 +169,20 @@ status, read logs, manage Docker containers, and trigger app rebuilds.
 
 ### Setup
 
-1. Install the MCP dependency:
-
-   ```bash
-   source .venv/bin/activate
-   pip install mcp
-   ```
-
-2. Add to your Claude Code MCP config (`~/.claude/settings.json` or project `.claude/settings.json`):
+1. Add to your Claude Code MCP config (`~/.claude/settings.json` or project `.claude/settings.json`):
 
    ```json
    {
      "mcpServers": {
        "servertui": {
-         "command": "/path/to/servertui/.venv/bin/python",
-         "args": ["mcp_server.py"],
-         "cwd": "/path/to/servertui"
+         "command": "servertui",
+         "args": ["mcp"]
        }
      }
    }
    ```
 
-3. Restart Claude Code. The tools will be available automatically.
+2. Restart Claude Code. The tools will be available automatically.
 
 ### Available Tools
 
