@@ -14,9 +14,15 @@ def main(argv: list[str] | None = None) -> int:
                         version=f"servertui {__version__}")
     sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    # Subcommands will be wired in subsequent tasks.
+    sub.add_parser("tui", help="Run the TUI (default).")
 
-    parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.cmd in (None, "tui"):
+        from servertui.tui import ServerTUI
+        ServerTUI().run()
+        return 0
+
     parser.print_help()
     return 2
 

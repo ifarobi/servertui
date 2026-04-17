@@ -19,7 +19,7 @@ import docker
 import psutil
 from textual.app import App as TextualApp, ComposeResult
 
-from core import (
+from servertui.core import (
     App as AppConfig,
     AppInfo,
     ENV_DIR,
