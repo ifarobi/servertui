@@ -1,4 +1,7 @@
-#!/bin/bash
-DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-source "$DIR/.venv/bin/activate"
-python "$DIR/app.py" "$@"
+#!/bin/sh
+# Dev launcher — runs ServerTUI from the repo checkout via uv.
+# For end-user install, see install.sh or `uv tool install servertui`.
+set -eu
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
+exec uv run servertui "$@"
