@@ -247,6 +247,7 @@ def parse_env_file(path: Path) -> list[tuple[str, str]]:
             inner = value[1:end]
             if quote == '"':
                 inner = (inner.replace(r"\n", "\n")
+                              .replace(r"\r", "\r")
                               .replace(r"\t", "\t")
                               .replace(r'\"', '"')
                               .replace(r"\\", "\\"))
@@ -276,7 +277,11 @@ def _quote_env_value(value: str) -> str:
                "0123456789_./:@+-")
     if all(ch in safe for ch in value):
         return value
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = (value.replace("\\", "\\\\")
+                    .replace('"', '\\"')
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                    .replace("\t", "\\t"))
     return f'"{escaped}"'
 
 
@@ -297,7 +302,6 @@ def merge_env_keys(
 
     Returns len(updates) on success. Raises OSError on filesystem errors.
     """
-    import datetime
     if not updates:
         return 0
 
@@ -307,12 +311,15 @@ def merge_env_keys(
             f"# Location: {canonical_path} (0600, injected via docker --env-file).\n"
             f"# Stored outside the git repo so secrets stay uncommitted.\n"
         ).encode()
-        fd = os.open(canonical_path,
-                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, header)
-        finally:
-            os.close(fd)
+            fd = os.open(canonical_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, header)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            pass
 
     text = canonical_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines(keepends=True)
@@ -353,7 +360,7 @@ def merge_env_keys(
     if appended:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] = lines[-1] + "\n"
-        today = datetime.date.today().isoformat()
+        today = datetime.now().date().isoformat()
         lines.append("\n")
         lines.append(f"# imported {today} from {source_label}\n")
         for key, value in appended:
