@@ -327,8 +327,33 @@ def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
 
     path = ENV_DIR / f"{app_cfg.name}.env"
     if not path.exists():
+        repo_env = app_cfg.repo_path / ".env"
+        if repo_env.is_file():
+            try:
+                repo_bytes = repo_env.read_bytes()
+            except OSError as e:
+                return (False, f"cannot read {repo_env}: {e}")
+            header = (
+                f"# ServerTUI: imported from {repo_env} on first edit.\n"
+                f"# Canonical location: {path} (0600, injected via "
+                f"docker --env-file).\n"
+                f"# Safe to delete these header lines.\n\n"
+            ).encode()
+            content = header + repo_bytes
+        else:
+            content = (
+                f"# ServerTUI env file for app '{app_cfg.name}'\n"
+                f"# Location: {path} (0600, injected via docker --env-file "
+                f"at rebuild).\n"
+                f"# Stored outside the git repo so secrets stay uncommitted.\n"
+                f"# Add KEY=value lines below.\n"
+            ).encode()
         try:
-            path.touch(mode=0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
         except OSError as e:
             return (False, f"cannot create {path}: {e}")
     else:
