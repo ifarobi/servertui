@@ -854,7 +854,7 @@ requires-dist = [
     { name = "docker", specifier = ">=7.0" },
     { name = "mcp", specifier = ">=1.0" },
     { name = "psutil", specifier = ">=5.9" },
-    { name = "textual", specifier = ">=0.60" },
+    { name = "textual", specifier = ">=1.0" },
 ]
 
 [[package]]
