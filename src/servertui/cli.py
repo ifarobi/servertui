@@ -15,12 +15,18 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
     sub.add_parser("tui", help="Run the TUI (default).")
+    sub.add_parser("mcp", help="Run the MCP server on stdio.")
 
     args = parser.parse_args(argv)
 
     if args.cmd in (None, "tui"):
         from servertui.tui import ServerTUI
         ServerTUI().run()
+        return 0
+
+    if args.cmd == "mcp":
+        from servertui.mcp import mcp
+        mcp.run()
         return 0
 
     parser.print_help()

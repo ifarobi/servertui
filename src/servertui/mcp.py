@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
-from core import (
+from servertui.core import (
     App,
     docker_action,
     docker_container_list,
