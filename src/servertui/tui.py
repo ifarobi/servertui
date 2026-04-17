@@ -327,19 +327,33 @@ def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
 
     path = ENV_DIR / f"{app_cfg.name}.env"
     if not path.exists():
-        repo_env = app_cfg.repo_path / ".env"
-        if repo_env.is_file():
+        candidate_names = (".env", ".env.local", ".env.development",
+                           ".env.staging", ".env.production")
+        candidates = [app_cfg.repo_path / n for n in candidate_names
+                      if (app_cfg.repo_path / n).is_file()]
+        if len(candidates) == 1:
+            src = candidates[0]
             try:
-                repo_bytes = repo_env.read_bytes()
+                repo_bytes = src.read_bytes()
             except OSError as e:
-                return (False, f"cannot read {repo_env}: {e}")
+                return (False, f"cannot read {src}: {e}")
             header = (
-                f"# ServerTUI: imported from {repo_env} on first edit.\n"
+                f"# ServerTUI: imported from {src} on first edit.\n"
                 f"# Canonical location: {path} (0600, injected via "
                 f"docker --env-file).\n"
                 f"# Safe to delete these header lines.\n\n"
             ).encode()
             content = header + repo_bytes
+        elif len(candidates) > 1:
+            names = ", ".join(c.name for c in candidates)
+            content = (
+                f"# ServerTUI env file for app '{app_cfg.name}'\n"
+                f"# Location: {path} (0600, injected via docker --env-file "
+                f"at rebuild).\n"
+                f"# Multiple .env* files detected in repo: {names}\n"
+                f"# Press I on the Apps tab to import from a specific source.\n"
+                f"# Add KEY=value lines below.\n"
+            ).encode()
         else:
             content = (
                 f"# ServerTUI env file for app '{app_cfg.name}'\n"
