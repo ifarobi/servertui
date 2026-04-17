@@ -29,6 +29,8 @@ from servertui.core import (
     fetch_app_status,
     fmt_bytes,
     load_apps,
+    merge_env_keys,
+    parse_env_file,
     rebuild_app,
     run_cmd,
 )
@@ -40,10 +42,12 @@ from textual.widgets import (
     Footer,
     Header,
     RichLog,
+    SelectionList,
     Static,
     TabbedContent,
     TabPane,
 )
+from rich.markup import escape as _rich_escape
 
 # ─── Config ──────────────────────────────────────────────────────────
 
@@ -327,8 +331,47 @@ def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
 
     path = ENV_DIR / f"{app_cfg.name}.env"
     if not path.exists():
+        candidate_names = (".env", ".env.local", ".env.development",
+                           ".env.staging", ".env.production")
+        candidates = [app_cfg.repo_path / n for n in candidate_names
+                      if (app_cfg.repo_path / n).is_file()]
+        if len(candidates) == 1:
+            src = candidates[0]
+            try:
+                repo_bytes = src.read_bytes()
+            except OSError as e:
+                return (False, f"cannot read {src}: {e}")
+            header = (
+                f"# ServerTUI: imported from {src} on first edit.\n"
+                f"# Canonical location: {path} (0600, injected via "
+                f"docker --env-file).\n"
+                f"# Safe to delete these header lines.\n\n"
+            ).encode()
+            content = header + repo_bytes
+        elif len(candidates) > 1:
+            names = ", ".join(c.name for c in candidates)
+            content = (
+                f"# ServerTUI env file for app '{app_cfg.name}'\n"
+                f"# Location: {path} (0600, injected via docker --env-file "
+                f"at rebuild).\n"
+                f"# Multiple .env* files detected in repo: {names}\n"
+                f"# Press I on the Apps tab to import from a specific source.\n"
+                f"# Add KEY=value lines below.\n"
+            ).encode()
+        else:
+            content = (
+                f"# ServerTUI env file for app '{app_cfg.name}'\n"
+                f"# Location: {path} (0600, injected via docker --env-file "
+                f"at rebuild).\n"
+                f"# Stored outside the git repo so secrets stay uncommitted.\n"
+                f"# Add KEY=value lines below.\n"
+            ).encode()
         try:
-            path.touch(mode=0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
         except OSError as e:
             return (False, f"cannot create {path}: {e}")
     else:
@@ -621,7 +664,8 @@ class AppPanel(Static):
             lines.append("")
 
         lines.append(
-            "[dim]  ⌨  [bold]R[/]=rebuild  [bold]E[/]=edit env  [bold]L[/]=logs[/]"
+            "[dim]  ⌨  [bold]R[/]=rebuild  [bold]E[/]=edit env  "
+            "[bold]I[/]=import env  [bold]L[/]=logs[/]"
         )
         self.query_one("#apps-content", Static).update("\n".join(lines))
 
@@ -696,6 +740,50 @@ class SelectorScreen(ModalScreen[str | None]):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.dismiss(str(event.row_key.value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ImportKeysScreen(ModalScreen[list[tuple[str, str]] | None]):
+    """Per-key selection modal for env import. Returns selected pairs or None."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Import", priority=True),
+    ]
+
+    def __init__(
+        self,
+        source_name: str,
+        pairs: list[tuple[str, str]],
+        canonical_keys: set[str],
+    ) -> None:
+        super().__init__()
+        self.source_name = source_name
+        self.pairs = pairs
+        self.canonical_keys = canonical_keys
+
+    def compose(self) -> ComposeResult:
+        with Container(id="selector-box"):
+            yield Static(
+                f"[bold]Import from {self.source_name}[/]\n"
+                f"[dim]Space to toggle, Enter to import, Esc to cancel[/]\n",
+                id="selector-title",
+            )
+            options = []
+            for i, (key, value) in enumerate(self.pairs):
+                preview = value if len(value) <= 40 else value[:37] + "…"
+                tag = "[yellow]replaces[/]" if key in self.canonical_keys else "[green]new[/]"
+                label = f"{_rich_escape(key)}={_rich_escape(preview)}  {tag}"
+                options.append((label, i, True))  # all selected by default
+            yield SelectionList[int](*options, id="import-list")
+
+    def action_submit(self) -> None:
+        sl = self.query_one("#import-list", SelectionList)
+        indices = sorted(sl.selected)
+        result = [self.pairs[i] for i in indices]
+        self.dismiss(result)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -864,7 +952,7 @@ class ServerTUI(TextualApp):
 
     #log-view { height: 1fr; }
 
-    SelectorScreen, LogScreen, BuildScreen { align: center middle; }
+    SelectorScreen, ImportKeysScreen, LogScreen, BuildScreen { align: center middle; }
     """
 
     BINDINGS = [
@@ -885,6 +973,7 @@ class ServerTUI(TextualApp):
         Binding("L", "app_logs", "App logs"),
         Binding("R", "app_rebuild", "Rebuild app"),
         Binding("E", "app_edit_env", "Edit env"),
+        Binding("I", "app_import_env", "Import env"),
         Binding("f", "refresh", "Refresh"),
     ]
 
@@ -1212,6 +1301,123 @@ class ServerTUI(TextualApp):
             )
 
         self.push_screen(SelectorScreen("Edit App Env", items), on_selected)
+
+    def action_app_import_env(self) -> None:
+        items = self._app_items()
+        if not items:
+            self.notify("No apps configured", severity="warning")
+            return
+
+        candidate_names = (".env", ".env.local", ".env.development",
+                           ".env.staging", ".env.production")
+
+        def on_app_chosen(name: str | None) -> None:
+            if name is None:
+                return
+            app_cfg = next((a for a in APPS if a.name == name), None)
+            if app_cfg is None:
+                return
+            if not app_cfg.repo_path.is_dir():
+                self.notify(
+                    f"{name}: repo not cloned — run Rebuild first",
+                    severity="warning",
+                )
+                return
+            candidates = [
+                app_cfg.repo_path / n
+                for n in candidate_names
+                if (app_cfg.repo_path / n).is_file()
+            ]
+            if not candidates:
+                self.notify(
+                    f"{name}: no .env files found in {app_cfg.repo_path}",
+                    severity="warning",
+                )
+                return
+
+            def on_source_chosen(source_name: str | None) -> None:
+                if source_name is None:
+                    return
+                source_path = app_cfg.repo_path / source_name
+                pairs = parse_env_file(source_path)
+                if not pairs:
+                    self.notify(
+                        f"no keys to import from {source_name}",
+                        severity="warning",
+                    )
+                    return
+                canonical = ENV_DIR / f"{app_cfg.name}.env"
+                canonical_keys: set[str] = set()
+                if canonical.exists():
+                    st = canonical.stat()
+                    if (st.st_mode & 0o777) != 0o600:
+                        self.notify(
+                            f"refusing to write: {canonical} has perms "
+                            f"{oct(st.st_mode & 0o777)}, expected 0o600",
+                            severity="error",
+                        )
+                        return
+                    canonical_keys = {k for k, _ in parse_env_file(canonical)}
+
+                def on_keys_chosen(
+                    selected: list[tuple[str, str]] | None,
+                ) -> None:
+                    if selected is None:
+                        return
+                    if not selected:
+                        self.notify("import cancelled — no keys selected")
+                        return
+                    try:
+                        count = merge_env_keys(canonical, selected, source_name)
+                    except OSError as e:
+                        self.notify(f"merge failed: {e}", severity="error")
+                        return
+                    bg_fetch_cheap()
+                    self._render_ui()
+                    self.notify(
+                        f"{name}: imported {count} keys from {source_name}"
+                    )
+
+                    def maybe_restart(choice: str | None) -> None:
+                        if choice != "yes":
+                            return
+                        container = f"servertui-{name}"
+                        try:
+                            client = docker.from_env()
+                            client.containers.get(container).restart()
+                            self.notify(f"Restarted {container}")
+                        except docker.errors.NotFound:
+                            self.notify(
+                                f"{container} not running — press R to rebuild",
+                                severity="warning",
+                            )
+                        except Exception as e:
+                            self.notify(
+                                f"Restart failed: {e}", severity="error"
+                            )
+                        self._start_bg_fetch()
+
+                    self.push_screen(
+                        SelectorScreen(
+                            f"{name}: env updated — restart container?",
+                            [("yes", "✅ yes, restart now"),
+                             ("no", "❌ no")],
+                        ),
+                        maybe_restart,
+                    )
+
+                self.push_screen(
+                    ImportKeysScreen(source_name, pairs, canonical_keys),
+                    on_keys_chosen,
+                )
+
+            source_items = [(c.name, c.name) for c in candidates]
+            self.push_screen(
+                SelectorScreen(f"{name}: pick source .env file", source_items),
+                on_source_chosen,
+            )
+
+        self.push_screen(SelectorScreen("Import App Env", items), on_app_chosen)
 
     def action_show_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id

@@ -8,6 +8,7 @@ rebuild logic.
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -190,6 +191,199 @@ def inspect_env_file(path: Path) -> tuple[int | None, bool]:
         return (count, perms_ok)
     except OSError:
         return (None, perms_ok)
+
+
+def parse_env_file(path: Path) -> list[tuple[str, str]]:
+    """Parse a .env-style file into an ordered list of (key, value) pairs.
+
+    Handles KEY=value, `export KEY=value`, quoted values ("..." or '...'),
+    inline # comments in unquoted values, and blank/comment lines.
+    Malformed lines are logged to stderr and skipped; parsing never raises.
+    Duplicate keys: last wins (matches Docker --env-file behavior).
+    """
+    key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    pairs: dict[str, str] = {}
+    order: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"[servertui] cannot read {path}: {e}", file=sys.stderr)
+        return []
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            print(f"[servertui] {path}:{lineno}: no '=' in line, skipping",
+                  file=sys.stderr)
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not key_re.match(key):
+            print(f"[servertui] {path}:{lineno}: invalid key {key!r}, skipping",
+                  file=sys.stderr)
+            continue
+        value = rest.lstrip()
+        if value.startswith('"') or value.startswith("'"):
+            quote = value[0]
+            end = -1
+            i = 1
+            while i < len(value):
+                ch = value[i]
+                if quote == '"' and ch == "\\" and i + 1 < len(value):
+                    i += 2
+                    continue
+                if ch == quote:
+                    end = i
+                    break
+                i += 1
+            if end == -1:
+                print(f"[servertui] {path}:{lineno}: unterminated quote, skipping",
+                      file=sys.stderr)
+                continue
+            inner = value[1:end]
+            if quote == '"':
+                out = []
+                i2 = 0
+                esc_map = {"n": "\n", "r": "\r", "t": "\t",
+                           '"': '"', "\\": "\\"}
+                while i2 < len(inner):
+                    if inner[i2] == "\\" and i2 + 1 < len(inner):
+                        nxt = inner[i2 + 1]
+                        out.append(esc_map.get(nxt, "\\" + nxt))
+                        i2 += 2
+                    else:
+                        out.append(inner[i2])
+                        i2 += 1
+                inner = "".join(out)
+            value = inner
+        else:
+            hash_idx = -1
+            for i, ch in enumerate(value):
+                if ch == "#" and (i == 0 or value[i - 1].isspace()):
+                    hash_idx = i
+                    break
+            if hash_idx != -1:
+                value = value[:hash_idx]
+            value = value.rstrip()
+        if key in pairs:
+            pairs[key] = value
+        else:
+            pairs[key] = value
+            order.append(key)
+    return [(k, pairs[k]) for k in order]
+
+
+def _quote_env_value(value: str) -> str:
+    """Emit a .env-compatible serialization of value."""
+    if value == "":
+        return ""
+    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+               "0123456789_./:@+-")
+    if all(ch in safe for ch in value):
+        return value
+    escaped = (value.replace("\\", "\\\\")
+                    .replace('"', '\\"')
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                    .replace("\t", "\\t"))
+    return f'"{escaped}"'
+
+
+def merge_env_keys(
+    canonical_path: Path,
+    updates: list[tuple[str, str]],
+    source_label: str,
+) -> int:
+    """Write updates into canonical_path, preserving comments and unrelated keys.
+
+    - Creates the file atomically (0600, O_EXCL) if missing, seeded with a
+      minimal header.
+    - Replaces existing KEY=... lines in place for keys present in canonical.
+    - Appends new keys under a dated `# imported …` marker.
+    - If a key appears multiple times in canonical, replaces the last
+      occurrence and deletes earlier ones (opportunistic dedup).
+    - Atomic write via <path>.tmp + os.replace.
+
+    Returns len(updates) on success. Raises OSError on filesystem errors.
+    """
+    if not updates:
+        return 0
+
+    if not canonical_path.exists():
+        header = (
+            f"# ServerTUI env file for '{canonical_path.stem}'\n"
+            f"# Location: {canonical_path} (0600, injected via docker --env-file).\n"
+            f"# Stored outside the git repo so secrets stay uncommitted.\n"
+        ).encode()
+        try:
+            fd = os.open(canonical_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, header)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            pass
+
+    text = canonical_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+
+    key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    key_lines: dict[str, list[int]] = {}
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        body = stripped
+        if body.startswith("export "):
+            body = body[len("export "):].lstrip()
+        if "=" not in body:
+            continue
+        key = body.split("=", 1)[0].strip()
+        if key_re.match(key):
+            key_lines.setdefault(key, []).append(idx)
+
+    in_place: list[tuple[str, str]] = []
+    appended: list[tuple[str, str]] = []
+    for key, value in updates:
+        if key in key_lines:
+            in_place.append((key, value))
+        else:
+            appended.append((key, value))
+
+    to_delete: set[int] = set()
+    for key, value in in_place:
+        indices = key_lines[key]
+        last = indices[-1]
+        lines[last] = f"{key}={_quote_env_value(value)}\n"
+        for earlier in indices[:-1]:
+            to_delete.add(earlier)
+    if to_delete:
+        lines = [line for i, line in enumerate(lines) if i not in to_delete]
+
+    if appended:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        today = datetime.now().date().isoformat()
+        lines.append("\n")
+        lines.append(f"# imported {today} from {source_label}\n")
+        for key, value in appended:
+            lines.append(f"{key}={_quote_env_value(value)}\n")
+
+    tmp_path = canonical_path.with_suffix(canonical_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, "".join(lines).encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, canonical_path)
+    return len(updates)
 
 
 def detect_build_mode(repo_path: Path, compose_file: str | None = None) -> str:
