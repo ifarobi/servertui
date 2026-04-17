@@ -14,8 +14,9 @@ def main(argv: list[str] | None = None) -> int:
                         version=f"servertui {__version__}")
     sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    sub.add_parser("tui", help="Run the TUI (default).")
-    sub.add_parser("mcp", help="Run the MCP server on stdio.")
+    sub.add_parser("tui",  help="Run the TUI (default).")
+    sub.add_parser("mcp",  help="Run the MCP server on stdio.")
+    sub.add_parser("init", help="Scaffold ~/.config/servertui/.")
 
     args = parser.parse_args(argv)
 
@@ -28,6 +29,10 @@ def main(argv: list[str] | None = None) -> int:
         from servertui.mcp import mcp
         mcp.run()
         return 0
+
+    if args.cmd == "init":
+        from servertui.init import run_init
+        return run_init()
 
     parser.print_help()
     return 2
