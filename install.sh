@@ -19,8 +19,10 @@ if ! command -v uv >/dev/null 2>&1; then
         echo "fallback: pipx install servertui" >&2
         exit 1
     fi
-    export PATH="$HOME/.local/bin:$PATH"
 fi
+# Always ensure ~/.local/bin is on PATH so the subsequent verify step can find
+# the servertui binary, regardless of whether uv was pre-installed.
+export PATH="$HOME/.local/bin:$PATH"
 
 # 3. Install / upgrade
 echo "==> Installing servertui with uv ..."
