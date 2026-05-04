@@ -26,9 +26,12 @@ from core import (
     clone_if_missing,
     docker_action,
     docker_container_stats,
+    env_dir_for,
     fetch_app_status,
     fmt_bytes,
+    list_env_files,
     load_apps,
+    migrate_legacy_env,
     rebuild_app,
     run_cmd,
 )
@@ -316,16 +319,26 @@ def bg_fetch_cheap():
     STORE.fetch_apps()
 
 
-def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
-    """Open the app's env file in $EDITOR. Creates it 0600 if missing.
+def edit_env_file(app_cfg: "AppConfig", filename: str = ".env") -> tuple[bool, str | None]:
+    """Open one of the app's env files in $EDITOR. Creates it 0600 if missing.
     Returns (changed, error). `changed` is True iff mtime advanced."""
+    if not filename.startswith(".env") or "/" in filename or filename in (".", ".."):
+        return (False, f"invalid env filename: {filename!r}")
     try:
         ENV_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(ENV_DIR, 0o700)
     except OSError as e:
         return (False, f"cannot create {ENV_DIR}: {e}")
 
-    path = ENV_DIR / f"{app_cfg.name}.env"
+    migrate_legacy_env(app_cfg.name)
+    app_env_dir = env_dir_for(app_cfg.name)
+    try:
+        app_env_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(app_env_dir, 0o700)
+    except OSError as e:
+        return (False, f"cannot create {app_env_dir}: {e}")
+
+    path = app_env_dir / filename
     if not path.exists():
         try:
             path.touch(mode=0o600)
@@ -1166,15 +1179,12 @@ class ServerTUI(TextualApp):
             self.notify("No apps configured", severity="warning")
             return
 
-        def on_selected(name: str | None) -> None:
-            if name is None:
-                return
-            app_cfg = next((a for a in APPS if a.name == name), None)
-            if app_cfg is None:
-                return
+        ENV_PRESETS = (".env", ".env.local", ".env.production",
+                       ".env.development", ".env.staging")
 
+        def edit_and_prompt(name: str, app_cfg: "AppConfig", filename: str) -> None:
             with self.suspend():
-                changed, err = edit_env_file(app_cfg)
+                changed, err = edit_env_file(app_cfg, filename)
 
             bg_fetch_cheap()
             self._render_ui()
@@ -1183,7 +1193,7 @@ class ServerTUI(TextualApp):
                 self.notify(err, severity="error")
                 return
             if not changed:
-                self.notify(f"{name}: env unchanged")
+                self.notify(f"{name}/{filename}: unchanged")
                 return
 
             def maybe_restart(choice: str | None) -> None:
@@ -1205,10 +1215,36 @@ class ServerTUI(TextualApp):
 
             self.push_screen(
                 SelectorScreen(
-                    f"{name}: env updated — restart container?",
+                    f"{name}/{filename} updated — restart container?",
                     [("yes", "✅ yes, restart now"), ("no", "❌ no")],
                 ),
                 maybe_restart,
+            )
+
+        def on_selected(name: str | None) -> None:
+            if name is None:
+                return
+            app_cfg = next((a for a in APPS if a.name == name), None)
+            if app_cfg is None:
+                return
+
+            migrate_legacy_env(name)
+            existing = [p.name for p in list_env_files(name)]
+            file_items: list[tuple[str, str]] = [
+                (n, f"{n}  [dim](edit)[/]") for n in existing
+            ]
+            for preset in ENV_PRESETS:
+                if preset not in existing:
+                    file_items.append((preset, f"{preset}  [dim](new)[/]"))
+
+            def on_file(filename: str | None) -> None:
+                if filename is None:
+                    return
+                edit_and_prompt(name, app_cfg, filename)
+
+            self.push_screen(
+                SelectorScreen(f"{name}: pick env file", file_items),
+                on_file,
             )
 
         self.push_screen(SelectorScreen("Edit App Env", items), on_selected)

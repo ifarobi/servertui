@@ -110,7 +110,12 @@ SERVERTUI_APPS_DIR=/opt/servertui/apps ./run.sh
 
 ### Env files
 
-Each app can have a dotenv file at `~/.config/servertui/env/<name>.env`. ServerTUI creates these with `600` permissions and warns if they're more permissive.
+Each app gets a directory at `~/.config/servertui/env/<name>/` for its dotenv files (`.env`, `.env.production`, `.env.local`, etc.). ServerTUI creates files with `600` permissions and warns if they're more permissive.
+
+- **Dockerfile mode**: each managed file is passed to `docker run` as a `--env-file`.
+- **Compose mode**: each managed file is symlinked into the repo as `<repo>/<filename>` before `docker compose up`, so `env_file:` entries and `${VAR}` interpolation just work. ServerTUI refuses to symlink over a git-tracked file.
+
+Legacy `~/.config/servertui/env/<name>.env` files are auto-migrated to `<name>/.env` on first read.
 
 ### Build modes
 

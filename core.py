@@ -168,6 +168,54 @@ def fmt_bytes(n: int | float) -> str:
     return f"{n:.1f} PB"
 
 
+def env_dir_for(app_name: str) -> Path:
+    return ENV_DIR / app_name
+
+
+def migrate_legacy_env(app_name: str) -> None:
+    """One-shot migration: ENV_DIR/<name>.env (file) -> ENV_DIR/<name>/.env."""
+    legacy = ENV_DIR / f"{app_name}.env"
+    if not legacy.is_file() or legacy.is_symlink():
+        return
+    new_dir = env_dir_for(app_name)
+    try:
+        new_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(new_dir, 0o700)
+        target = new_dir / ".env"
+        if not target.exists():
+            legacy.rename(target)
+    except OSError:
+        pass
+
+
+def list_env_files(app_name: str) -> list[Path]:
+    """Sorted .env* files in the app's env dir. Empty if dir missing."""
+    d = env_dir_for(app_name)
+    if not d.is_dir():
+        return []
+    return sorted(
+        p for p in d.iterdir()
+        if p.is_file() and not p.is_symlink() and p.name.startswith(".env")
+    )
+
+
+def inspect_env_dir(app_name: str) -> tuple[int | None, bool]:
+    """Aggregate key count + perms across all managed env files for app."""
+    files = list_env_files(app_name)
+    if not files:
+        return (None, True)
+    total = 0
+    perms_ok = True
+    any_readable = False
+    for p in files:
+        c, ok = inspect_env_file(p)
+        perms_ok = perms_ok and ok
+        if c is not None:
+            total += c
+            any_readable = True
+    return (total if any_readable else None, perms_ok)
+
+
 def inspect_env_file(path: Path) -> tuple[int | None, bool]:
     """Return (key_count, perms_ok). key_count is None if file missing.
     perms_ok is True when the file is missing OR its mode is exactly 0o600."""
@@ -364,8 +412,8 @@ def fetch_app_status(apps: list[App], tunnel_status_by_service: dict[str, str] |
             except Exception:
                 status = "missing"
 
-        env_path = ENV_DIR / f"{app.name}.env"
-        env_count, env_perms_ok = inspect_env_file(env_path)
+        migrate_legacy_env(app.name)
+        env_count, env_perms_ok = inspect_env_dir(app.name)
 
         tunnel_service = (
             f"cloudflared-{app.tunnel}" if app.tunnel else None
@@ -407,7 +455,8 @@ def rebuild_app(app: App):
     """Generator that yields output lines from git pull + build + restart.
     Final yielded value is a string '[exit 0]' or '[exit N]'."""
     container = f"servertui-{app.name}"
-    env_path = ENV_DIR / f"{app.name}.env"
+    migrate_legacy_env(app.name)
+    env_files = list_env_files(app.name)
 
     cs = get_clone_status(app.name)
     if cs == "cloning":
@@ -430,11 +479,11 @@ def rebuild_app(app: App):
         yield "[exit 1]"
         return
 
-    if env_path.exists():
-        st = env_path.stat()
+    for ef in env_files:
+        st = ef.stat()
         if (st.st_mode & 0o777) != 0o600:
-            yield f"[red]env file perms looser than 600: {env_path}[/]"
-            yield "[red]fix with: chmod 600 {}[/]".format(env_path)
+            yield f"[red]env file perms looser than 600: {ef}[/]"
+            yield "[red]fix with: chmod 600 {}[/]".format(ef)
             yield "[exit 1]"
             return
 
@@ -503,8 +552,8 @@ def rebuild_app(app: App):
             "--name", container,
             "--restart", "unless-stopped",
         ]
-        if env_path.exists():
-            run_cmd_list += ["--env-file", str(env_path)]
+        for ef in env_files:
+            run_cmd_list += ["--env-file", str(ef)]
         run_cmd_list.append(image_tag)
 
         rc = None
@@ -523,12 +572,29 @@ def rebuild_app(app: App):
         compose_file = app.repo_path / "compose.yml"
         if not compose_file.exists():
             compose_file = app.repo_path / "docker-compose.yml"
-    if env_path.exists():
-        yield (
-            "[yellow]note: compose mode -- ServerTUI's env file is NOT auto-wired.[/]\n"
-            "[yellow]Reference it in compose.yml via `env_file: "
-            f"{env_path}` or `${{VAR}}` interpolation.[/]"
+    for ef in env_files:
+        link = app.repo_path / ef.name
+        # Refuse to shadow a git-tracked file (would break future git pulls).
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", ef.name],
+            cwd=str(app.repo_path), capture_output=True, text=True,
         )
+        if tracked.returncode == 0 and not link.is_symlink():
+            yield f"[red]{link} is tracked in git -- refusing to overwrite with managed env[/]"
+            yield f"[red]either untrack it (git rm --cached {ef.name}) or rename the managed file[/]"
+            yield "[exit 1]"
+            return
+        try:
+            if link.is_symlink() or link.exists():
+                if not (link.is_symlink() and link.resolve() == ef.resolve()):
+                    link.unlink()
+                    link.symlink_to(ef)
+            else:
+                link.symlink_to(ef)
+            yield f"[dim]wired env: {ef.name} -> {ef}[/]"
+        except OSError as e:
+            yield f"[yellow]could not symlink {link}: {e}[/]"
+            yield f"[yellow]compose may fail if it references {ef.name}[/]"
     cmd = ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"]
     rc = None
     for item in stream(cmd, cwd=app.repo_path):
