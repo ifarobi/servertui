@@ -193,6 +193,72 @@ def inspect_env_file(path: Path) -> tuple[int | None, bool]:
         return (None, perms_ok)
 
 
+def env_dir_for(app_name: str) -> Path:
+    """Per-app env directory under ENV_DIR."""
+    return ENV_DIR / app_name
+
+
+def migrate_legacy_env(app_name: str) -> None:
+    """One-shot: ENV_DIR/<name>.env (regular file) -> ENV_DIR/<name>/.env.
+
+    Silent no-op if already migrated, target exists, or any OSError.
+    Safe to call from hot paths (fetch_app_status, edit_env_file)."""
+    legacy = ENV_DIR / f"{app_name}.env"
+    if not legacy.is_file() or legacy.is_symlink():
+        return
+    new_dir = env_dir_for(app_name)
+    target = new_dir / ".env"
+    try:
+        new_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(new_dir, 0o700)
+        if target.exists():
+            print(
+                f"[servertui] migrate skipped: both {legacy} and {target} exist; "
+                "leaving legacy in place — please resolve manually",
+                file=sys.stderr,
+            )
+            return
+        legacy.rename(target)
+    except OSError as e:
+        print(f"[servertui] migrate {legacy} -> {target} failed: {e}",
+              file=sys.stderr)
+
+
+def list_env_files(app_name: str) -> list[Path]:
+    """Sorted .env* regular files in the app's env dir. Empty if dir missing.
+
+    Excludes symlinks and subdirectories. Order: filename-sorted so .env
+    precedes .env.production (Docker applies later --env-file on top of earlier)."""
+    d = env_dir_for(app_name)
+    if not d.is_dir():
+        return []
+    return sorted(
+        p for p in d.iterdir()
+        if p.is_file() and not p.is_symlink() and p.name.startswith(".env")
+    )
+
+
+def inspect_env_dir(app_name: str) -> tuple[int | None, bool]:
+    """Aggregate (key_count, perms_ok) across all managed env files for an app.
+
+    key_count is None when no managed files exist (matches inspect_env_file's
+    "missing" semantic); otherwise it is the sum across files. perms_ok is the
+    AND across files."""
+    files = list_env_files(app_name)
+    if not files:
+        return (None, True)
+    total = 0
+    perms_ok = True
+    any_readable = False
+    for p in files:
+        c, ok = inspect_env_file(p)
+        perms_ok = perms_ok and ok
+        if c is not None:
+            total += c
+            any_readable = True
+    return (total if any_readable else None, perms_ok)
+
+
 def parse_env_file(path: Path) -> list[tuple[str, str]]:
     """Parse a .env-style file into an ordered list of (key, value) pairs.
 
