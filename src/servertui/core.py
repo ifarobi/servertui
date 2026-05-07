@@ -677,8 +677,8 @@ def fetch_app_status(apps: list[App], tunnel_status_by_service: dict[str, str] |
             except Exception:
                 status = "missing"
 
-        env_path = ENV_DIR / f"{app.name}.env"
-        env_count, env_perms_ok = inspect_env_file(env_path)
+        migrate_legacy_env(app.name)
+        env_count, env_perms_ok = inspect_env_dir(app.name)
 
         tunnel_service = (
             f"cloudflared-{app.tunnel}" if app.tunnel else None
