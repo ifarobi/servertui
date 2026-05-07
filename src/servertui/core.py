@@ -259,6 +259,59 @@ def inspect_env_dir(app_name: str) -> tuple[int | None, bool]:
     return (total if any_readable else None, perms_ok)
 
 
+def wire_env_into_repo(app_name: str, repo_path: Path) -> tuple[bool, list[str]]:
+    """Symlink every managed env file into <repo_path>/<filename>.
+
+    Returns (ok, messages). On any abort condition `ok` is False and the
+    last message explains why; on success `ok` is True and messages contain
+    one [dim] line per wired file. Idempotent: existing correct symlinks
+    are left untouched.
+
+    Aborts on:
+    - filename outside the .env* allowlist (defensive)
+    - target path is a real (non-symlink) git-tracked file
+    - any OSError during symlink creation
+    """
+    messages: list[str] = []
+    for ef in list_env_files(app_name):
+        if not ef.name.startswith(".env") or "/" in ef.name:
+            messages.append(f"[red]refusing unsafe filename: {ef.name}[/]")
+            return (False, messages)
+        link = repo_path / ef.name
+        if not link.is_symlink():
+            try:
+                tracked = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", ef.name],
+                    cwd=str(repo_path), capture_output=True, text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                messages.append(f"[red]git ls-files failed for {ef.name}: {e}[/]")
+                return (False, messages)
+            if tracked.returncode == 0 and link.exists():
+                messages.append(
+                    f"[red]{link} is tracked in git -- refusing to overwrite "
+                    "with managed env[/]"
+                )
+                messages.append(
+                    f"[red]either untrack it (git rm --cached {ef.name}) "
+                    "or rename the managed file[/]"
+                )
+                return (False, messages)
+        try:
+            if link.is_symlink() or link.exists():
+                if link.is_symlink() and link.resolve() == ef.resolve():
+                    messages.append(f"[dim]env wired (unchanged): {ef.name}[/]")
+                    continue
+                link.unlink()
+            link.symlink_to(ef)
+            messages.append(f"[dim]wired env: {ef.name} -> {ef}[/]")
+        except OSError as e:
+            messages.append(f"[red]could not symlink {link}: {e}[/]")
+            return (False, messages)
+    return (True, messages)
+
+
 def parse_env_file(path: Path) -> list[tuple[str, str]]:
     """Parse a .env-style file into an ordered list of (key, value) pairs.
 
