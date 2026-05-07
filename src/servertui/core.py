@@ -193,6 +193,125 @@ def inspect_env_file(path: Path) -> tuple[int | None, bool]:
         return (None, perms_ok)
 
 
+def env_dir_for(app_name: str) -> Path:
+    """Per-app env directory under ENV_DIR."""
+    return ENV_DIR / app_name
+
+
+def migrate_legacy_env(app_name: str) -> None:
+    """One-shot: ENV_DIR/<name>.env (regular file) -> ENV_DIR/<name>/.env.
+
+    Silent no-op if already migrated, target exists, or any OSError.
+    Safe to call from hot paths (fetch_app_status, edit_env_file)."""
+    legacy = ENV_DIR / f"{app_name}.env"
+    if not legacy.is_file() or legacy.is_symlink():
+        return
+    new_dir = env_dir_for(app_name)
+    target = new_dir / ".env"
+    try:
+        new_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(new_dir, 0o700)
+        if target.exists():
+            print(
+                f"[servertui] migrate skipped: both {legacy} and {target} exist; "
+                "leaving legacy in place — please resolve manually",
+                file=sys.stderr,
+            )
+            return
+        legacy.rename(target)
+    except OSError as e:
+        print(f"[servertui] migrate {legacy} -> {target} failed: {e}",
+              file=sys.stderr)
+
+
+def list_env_files(app_name: str) -> list[Path]:
+    """Sorted .env* regular files in the app's env dir. Empty if dir missing.
+
+    Excludes symlinks and subdirectories. Order: filename-sorted so .env
+    precedes .env.production (Docker applies later --env-file on top of earlier)."""
+    d = env_dir_for(app_name)
+    if not d.is_dir():
+        return []
+    return sorted(
+        p for p in d.iterdir()
+        if p.is_file() and not p.is_symlink() and p.name.startswith(".env")
+    )
+
+
+def inspect_env_dir(app_name: str) -> tuple[int | None, bool]:
+    """Aggregate (key_count, perms_ok) across all managed env files for an app.
+
+    key_count is None when no managed files exist (matches inspect_env_file's
+    "missing" semantic); otherwise it is the sum across files. perms_ok is the
+    AND across files."""
+    files = list_env_files(app_name)
+    if not files:
+        return (None, True)
+    total = 0
+    perms_ok = True
+    any_readable = False
+    for p in files:
+        c, ok = inspect_env_file(p)
+        perms_ok = perms_ok and ok
+        if c is not None:
+            total += c
+            any_readable = True
+    return (total if any_readable else None, perms_ok)
+
+
+def wire_env_into_repo(app_name: str, repo_path: Path) -> tuple[bool, list[str]]:
+    """Symlink every managed env file into <repo_path>/<filename>.
+
+    Returns (ok, messages). On any abort condition `ok` is False and the
+    last message explains why; on success `ok` is True and messages contain
+    one [dim] line per wired file. Idempotent: existing correct symlinks
+    are left untouched.
+
+    Aborts on:
+    - filename outside the .env* allowlist (defensive)
+    - target path is a real (non-symlink) git-tracked file
+    - any OSError during symlink creation
+    """
+    messages: list[str] = []
+    for ef in list_env_files(app_name):
+        if not ef.name.startswith(".env") or "/" in ef.name:
+            messages.append(f"[red]refusing unsafe filename: {ef.name}[/]")
+            return (False, messages)
+        link = repo_path / ef.name
+        if not link.is_symlink():
+            try:
+                tracked = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", ef.name],
+                    cwd=str(repo_path), capture_output=True, text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                messages.append(f"[red]git ls-files failed for {ef.name}: {e}[/]")
+                return (False, messages)
+            if tracked.returncode == 0 and link.exists():
+                messages.append(
+                    f"[red]{link} is tracked in git -- refusing to overwrite "
+                    "with managed env[/]"
+                )
+                messages.append(
+                    f"[red]either untrack it (git rm --cached {ef.name}) "
+                    "or rename the managed file[/]"
+                )
+                return (False, messages)
+        try:
+            if link.is_symlink() or link.exists():
+                if link.is_symlink() and link.resolve() == ef.resolve():
+                    messages.append(f"[dim]env wired (unchanged): {ef.name}[/]")
+                    continue
+                link.unlink()
+            link.symlink_to(ef)
+            messages.append(f"[dim]wired env: {ef.name} -> {ef}[/]")
+        except OSError as e:
+            messages.append(f"[red]could not symlink {link}: {e}[/]")
+            return (False, messages)
+    return (True, messages)
+
+
 def parse_env_file(path: Path) -> list[tuple[str, str]]:
     """Parse a .env-style file into an ordered list of (key, value) pairs.
 
@@ -558,8 +677,8 @@ def fetch_app_status(apps: list[App], tunnel_status_by_service: dict[str, str] |
             except Exception:
                 status = "missing"
 
-        env_path = ENV_DIR / f"{app.name}.env"
-        env_count, env_perms_ok = inspect_env_file(env_path)
+        migrate_legacy_env(app.name)
+        env_count, env_perms_ok = inspect_env_dir(app.name)
 
         tunnel_service = (
             f"cloudflared-{app.tunnel}" if app.tunnel else None
@@ -601,7 +720,8 @@ def rebuild_app(app: App):
     """Generator that yields output lines from git pull + build + restart.
     Final yielded value is a string '[exit 0]' or '[exit N]'."""
     container = f"servertui-{app.name}"
-    env_path = ENV_DIR / f"{app.name}.env"
+    migrate_legacy_env(app.name)
+    env_files = list_env_files(app.name)
 
     cs = get_clone_status(app.name)
     if cs == "cloning":
@@ -624,11 +744,11 @@ def rebuild_app(app: App):
         yield "[exit 1]"
         return
 
-    if env_path.exists():
-        st = env_path.stat()
+    for ef in env_files:
+        st = ef.stat()
         if (st.st_mode & 0o777) != 0o600:
-            yield f"[red]env file perms looser than 600: {env_path}[/]"
-            yield "[red]fix with: chmod 600 {}[/]".format(env_path)
+            yield f"[red]env file perms looser than 600: {ef}[/]"
+            yield "[red]fix with: chmod 600 {}[/]".format(ef)
             yield "[exit 1]"
             return
 
@@ -697,8 +817,8 @@ def rebuild_app(app: App):
             "--name", container,
             "--restart", "unless-stopped",
         ]
-        if env_path.exists():
-            run_cmd_list += ["--env-file", str(env_path)]
+        for ef in env_files:
+            run_cmd_list += ["--env-file", str(ef)]
         run_cmd_list.append(image_tag)
 
         rc = None
@@ -717,12 +837,13 @@ def rebuild_app(app: App):
         compose_file = app.repo_path / "compose.yml"
         if not compose_file.exists():
             compose_file = app.repo_path / "docker-compose.yml"
-    if env_path.exists():
-        yield (
-            "[yellow]note: compose mode -- ServerTUI's env file is NOT auto-wired.[/]\n"
-            "[yellow]Reference it in compose.yml via `env_file: "
-            f"{env_path}` or `${{VAR}}` interpolation.[/]"
-        )
+    if env_files:
+        ok, msgs = wire_env_into_repo(app.name, app.repo_path)
+        for m in msgs:
+            yield m
+        if not ok:
+            yield "[exit 1]"
+            return
     cmd = ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"]
     rc = None
     for item in stream(cmd, cwd=app.repo_path):
