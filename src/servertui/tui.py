@@ -1409,7 +1409,16 @@ class ServerTUI(TextualApp):
                         severity="warning",
                     )
                     return
-                canonical = ENV_DIR / f"{app_cfg.name}.env"
+                migrate_legacy_env(app_cfg.name)
+                dest_dir = env_dir_for(app_cfg.name)
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    os.chmod(dest_dir, 0o700)
+                except OSError as e:
+                    self.notify(f"cannot create {dest_dir}: {e}",
+                                severity="error")
+                    return
+                canonical = dest_dir / source_name
                 canonical_keys: set[str] = set()
                 if canonical.exists():
                     st = canonical.stat()
