@@ -1295,15 +1295,12 @@ class ServerTUI(TextualApp):
             self.notify("No apps configured", severity="warning")
             return
 
-        def on_selected(name: str | None) -> None:
-            if name is None:
-                return
-            app_cfg = next((a for a in APPS if a.name == name), None)
-            if app_cfg is None:
-                return
+        ENV_PRESETS = (".env", ".env.local", ".env.production",
+                       ".env.development", ".env.staging")
 
+        def edit_and_prompt(name: str, app_cfg: "AppConfig", filename: str) -> None:
             with self.suspend():
-                changed, err = edit_env_file(app_cfg)
+                changed, err = edit_env_file(app_cfg, filename)
 
             bg_fetch_cheap()
             self._render_ui()
@@ -1312,7 +1309,7 @@ class ServerTUI(TextualApp):
                 self.notify(err, severity="error")
                 return
             if not changed:
-                self.notify(f"{name}: env unchanged")
+                self.notify(f"{name}/{filename}: unchanged")
                 return
 
             def maybe_restart(choice: str | None) -> None:
@@ -1334,13 +1331,39 @@ class ServerTUI(TextualApp):
 
             self.push_screen(
                 SelectorScreen(
-                    f"{name}: env updated — restart container?",
+                    f"{name}/{filename} updated — restart container?",
                     [("yes", "✅ yes, restart now"), ("no", "❌ no")],
                 ),
                 maybe_restart,
             )
 
-        self.push_screen(SelectorScreen("Edit App Env", items), on_selected)
+        def on_app(name: str | None) -> None:
+            if name is None:
+                return
+            app_cfg = next((a for a in APPS if a.name == name), None)
+            if app_cfg is None:
+                return
+
+            migrate_legacy_env(name)
+            existing = [p.name for p in list_env_files(name)]
+            file_items: list[tuple[str, str]] = [
+                (n, f"{n}  [dim](edit)[/]") for n in existing
+            ]
+            for preset in ENV_PRESETS:
+                if preset not in existing:
+                    file_items.append((preset, f"{preset}  [dim](new)[/]"))
+
+            def on_file(filename: str | None) -> None:
+                if filename is None:
+                    return
+                edit_and_prompt(name, app_cfg, filename)
+
+            self.push_screen(
+                SelectorScreen(f"{name}: pick env file", file_items),
+                on_file,
+            )
+
+        self.push_screen(SelectorScreen("Edit App Env", items), on_app)
 
     def action_app_import_env(self) -> None:
         items = self._app_items()
