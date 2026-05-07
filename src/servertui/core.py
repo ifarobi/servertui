@@ -720,7 +720,8 @@ def rebuild_app(app: App):
     """Generator that yields output lines from git pull + build + restart.
     Final yielded value is a string '[exit 0]' or '[exit N]'."""
     container = f"servertui-{app.name}"
-    env_path = ENV_DIR / f"{app.name}.env"
+    migrate_legacy_env(app.name)
+    env_files = list_env_files(app.name)
 
     cs = get_clone_status(app.name)
     if cs == "cloning":
@@ -743,11 +744,11 @@ def rebuild_app(app: App):
         yield "[exit 1]"
         return
 
-    if env_path.exists():
-        st = env_path.stat()
+    for ef in env_files:
+        st = ef.stat()
         if (st.st_mode & 0o777) != 0o600:
-            yield f"[red]env file perms looser than 600: {env_path}[/]"
-            yield "[red]fix with: chmod 600 {}[/]".format(env_path)
+            yield f"[red]env file perms looser than 600: {ef}[/]"
+            yield "[red]fix with: chmod 600 {}[/]".format(ef)
             yield "[exit 1]"
             return
 
@@ -816,8 +817,8 @@ def rebuild_app(app: App):
             "--name", container,
             "--restart", "unless-stopped",
         ]
-        if env_path.exists():
-            run_cmd_list += ["--env-file", str(env_path)]
+        for ef in env_files:
+            run_cmd_list += ["--env-file", str(ef)]
         run_cmd_list.append(image_tag)
 
         rc = None
@@ -836,12 +837,13 @@ def rebuild_app(app: App):
         compose_file = app.repo_path / "compose.yml"
         if not compose_file.exists():
             compose_file = app.repo_path / "docker-compose.yml"
-    if env_path.exists():
-        yield (
-            "[yellow]note: compose mode -- ServerTUI's env file is NOT auto-wired.[/]\n"
-            "[yellow]Reference it in compose.yml via `env_file: "
-            f"{env_path}` or `${{VAR}}` interpolation.[/]"
-        )
+    if env_files:
+        ok, msgs = wire_env_into_repo(app.name, app.repo_path)
+        for m in msgs:
+            yield m
+        if not ok:
+            yield "[exit 1]"
+            return
     cmd = ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"]
     rc = None
     for item in stream(cmd, cwd=app.repo_path):
