@@ -26,10 +26,13 @@ from servertui.core import (
     clone_if_missing,
     docker_action,
     docker_container_stats,
+    env_dir_for,
     fetch_app_status,
     fmt_bytes,
+    list_env_files,
     load_apps,
     merge_env_keys,
+    migrate_legacy_env,
     parse_env_file,
     rebuild_app,
     run_cmd,
@@ -320,50 +323,56 @@ def bg_fetch_cheap():
     STORE.fetch_apps()
 
 
-def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
-    """Open the app's env file in $EDITOR. Creates it 0600 if missing.
-    Returns (changed, error). `changed` is True iff mtime advanced."""
+def edit_env_file(
+    app_cfg: "AppConfig", filename: str = ".env",
+) -> tuple[bool, str | None]:
+    """Open one of the app's managed env files in $EDITOR.
+
+    Creates the file 0600 if missing, with a header that depends on whether
+    the repo has a same-named file we could seed from. Returns (changed, error)
+    where `changed` is True iff mtime advanced.
+    """
+    if (
+        not filename.startswith(".env")
+        or "/" in filename
+        or filename in (".", "..")
+    ):
+        return (False, f"invalid env filename: {filename!r}")
     try:
         ENV_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(ENV_DIR, 0o700)
     except OSError as e:
         return (False, f"cannot create {ENV_DIR}: {e}")
 
-    path = ENV_DIR / f"{app_cfg.name}.env"
+    migrate_legacy_env(app_cfg.name)
+    app_dir = env_dir_for(app_cfg.name)
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(app_dir, 0o700)
+    except OSError as e:
+        return (False, f"cannot create {app_dir}: {e}")
+
+    path = app_dir / filename
     if not path.exists():
-        candidate_names = (".env", ".env.local", ".env.development",
-                           ".env.staging", ".env.production")
-        candidates = [app_cfg.repo_path / n for n in candidate_names
-                      if (app_cfg.repo_path / n).is_file()]
-        if len(candidates) == 1:
-            src = candidates[0]
+        repo_src = app_cfg.repo_path / filename
+        if repo_src.is_file():
             try:
-                repo_bytes = src.read_bytes()
+                seed_bytes = repo_src.read_bytes()
             except OSError as e:
-                return (False, f"cannot read {src}: {e}")
+                return (False, f"cannot read {repo_src}: {e}")
             header = (
-                f"# ServerTUI: imported from {src} on first edit.\n"
-                f"# Canonical location: {path} (0600, injected via "
-                f"docker --env-file).\n"
+                f"# ServerTUI: imported from {repo_src} on first edit.\n"
+                f"# Canonical: {path} (0600).\n"
+                f"# In compose mode, ServerTUI symlinks this back into the repo.\n"
                 f"# Safe to delete these header lines.\n\n"
             ).encode()
-            content = header + repo_bytes
-        elif len(candidates) > 1:
-            names = ", ".join(c.name for c in candidates)
-            content = (
-                f"# ServerTUI env file for app '{app_cfg.name}'\n"
-                f"# Location: {path} (0600, injected via docker --env-file "
-                f"at rebuild).\n"
-                f"# Multiple .env* files detected in repo: {names}\n"
-                f"# Press I on the Apps tab to import from a specific source.\n"
-                f"# Add KEY=value lines below.\n"
-            ).encode()
+            content = header + seed_bytes
         else:
             content = (
-                f"# ServerTUI env file for app '{app_cfg.name}'\n"
-                f"# Location: {path} (0600, injected via docker --env-file "
-                f"at rebuild).\n"
-                f"# Stored outside the git repo so secrets stay uncommitted.\n"
+                f"# ServerTUI env file for app '{app_cfg.name}': {filename}\n"
+                f"# Canonical: {path} (0600).\n"
+                f"# In compose mode, ServerTUI symlinks this back into the repo\n"
+                f"# as {app_cfg.repo_path / filename} at rebuild time.\n"
                 f"# Add KEY=value lines below.\n"
             ).encode()
         try:
@@ -391,7 +400,6 @@ def edit_env_file(app_cfg: "AppConfig") -> tuple[bool, str | None]:
     if proc.returncode != 0:
         return (False, f"{editor} exited with code {proc.returncode}")
 
-    # Re-check perms — some editors (or `:!chmod` inside vim) can drift them.
     try:
         st_after = path.stat()
     except OSError as e:
